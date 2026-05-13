@@ -80,6 +80,20 @@ schedule/123456789.ics
 /课程表删除
 ```
 
+## AI 工具调用
+
+插件会向 AstrBot 注册以下 LLM tools，供模型在对话中按需查询已保存的课程表：
+
+```text
+query_course_schedule(query="")
+query_course_schedule_day(day="today", query="")
+list_course_schedules()
+query_group_current_courses()
+```
+
+`query` 支持 QQ 号或昵称关键字，留空表示查询发起人自己。`day` 支持 `today`、`tomorrow`、
+`今天`、`明天` 或 `YYYY-MM-DD`。按日期查询需要课程表来自 `.ics` 导入；手动文本保存的课程表会返回原始文本。
+
 ## 示例
 
 ```text

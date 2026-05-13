@@ -435,6 +435,25 @@ def _duration_hours(occurrences: list[dict[str, Any]]) -> float:
     return seconds / 3600
 
 
+def _is_own_query(query: str) -> bool:
+    return str(query or "").strip().lower() in {"", "我", "自己", "本人", "me", "self"}
+
+
+def _parse_date_query(day: str) -> tuple[date | None, str]:
+    normalized = str(day or "").strip().lower()
+    today = datetime.now(LOCAL_TZ).date()
+    if normalized in {"", "today", "今天", "今日"}:
+        return today, "今天"
+    if normalized in {"tomorrow", "明天", "明日"}:
+        return today + timedelta(days=1), "明天"
+
+    try:
+        parsed = date.fromisoformat(normalized)
+        return parsed, f"{parsed:%Y-%m-%d}"
+    except ValueError:
+        return None, ""
+
+
 def _help_text() -> str:
     return "\n".join(
         [
@@ -585,7 +604,7 @@ def _draw_rows_image(title: str, rows: list[dict[str, str]], filename: str) -> s
     return path
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.1.0")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.2.0")
 class CourseSchedulePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -678,6 +697,48 @@ class CourseSchedulePlugin(Star):
 
         return deleted
 
+    async def _resolve_member_info(
+        self, event: AstrMessageEvent, query: str = ""
+    ) -> tuple[str | None, dict[str, Any] | None, str | None]:
+        members = await self._get_scope_members(event)
+        if not members:
+            return None, None, "当前会话还没有保存任何课程表。"
+
+        normalized_query = str(query or "").strip()
+        target_id = event.get_sender_id()
+
+        if not _is_own_query(normalized_query):
+            matched_ids = [
+                user_id
+                for user_id, info in members.items()
+                if isinstance(info, dict)
+                and (
+                    normalized_query == user_id
+                    or normalized_query in str(info.get("name", ""))
+                )
+            ]
+            if not matched_ids:
+                return None, None, f"没有找到“{normalized_query}”的课程表。"
+
+            if len(matched_ids) > 1:
+                names = [
+                    f"{members[user_id].get('name') or user_id}({user_id})"
+                    for user_id in matched_ids[:10]
+                    if isinstance(members.get(user_id), dict)
+                ]
+                return None, None, "找到多个匹配成员，请用 QQ 号精确查询：\n" + "\n".join(names)
+
+            target_id = matched_ids[0]
+
+        info = members.get(target_id)
+        if not isinstance(info, dict):
+            if normalized_query and not _is_own_query(normalized_query):
+                return None, None, f"没有找到“{normalized_query}”的课程表。"
+
+            return None, None, "你还没有保存课程表，先使用 /课程表 保存 <内容>。"
+
+        return target_id, info, None
+
     async def _save_schedule_text(self, event: AstrMessageEvent, content: str) -> str:
         if not content:
             return "请在命令后输入课程表内容，例如：/课程表 保存 周一 1-2 高数 @ 教一101"
@@ -689,35 +750,9 @@ class CourseSchedulePlugin(Star):
         return f"已保存你在{_scope_label(event)}的课程表。"
 
     async def _show_schedule_text(self, event: AstrMessageEvent, query: str = "") -> str:
-        members = await self._get_scope_members(event)
-        if not members:
-            return "当前会话还没有保存任何课程表。"
-
-        target_id = event.get_sender_id()
-        if query:
-            matched_ids = [
-                user_id
-                for user_id, info in members.items()
-                if query == user_id or query in str(info.get("name", ""))
-            ]
-            if not matched_ids:
-                return f"没有找到“{query}”的课程表。"
-
-            if len(matched_ids) > 1:
-                names = [
-                    f"{members[user_id].get('name') or user_id}({user_id})"
-                    for user_id in matched_ids[:10]
-                ]
-                return "找到多个匹配成员，请用 QQ 号精确查询：\n" + "\n".join(names)
-
-            target_id = matched_ids[0]
-
-        info = members.get(target_id)
-        if not info:
-            if query:
-                return f"没有找到“{query}”的课程表。"
-
-            return "你还没有保存课程表，先使用 /课程表 保存 <内容>。"
+        target_id, info, error = await self._resolve_member_info(event, query)
+        if error:
+            return error
 
         name = info.get("name") or target_id
         schedule = info.get("schedule") or "空"
@@ -732,6 +767,7 @@ class CourseSchedulePlugin(Star):
         lines = [
             f"{info.get('name') or user_id}({user_id})"
             for user_id, info in members.items()
+            if isinstance(info, dict)
         ]
         return f"{_scope_label(event)}已保存 {len(lines)} 份课程表：\n" + "\n".join(lines)
 
@@ -997,6 +1033,72 @@ class CourseSchedulePlugin(Star):
         lines.extend(_format_occurrence_line(item) for item in occurrences)
         return "\n".join(lines)
 
+    async def _member_day_schedule_text(
+        self, event: AstrMessageEvent, query: str, day: str
+    ) -> str:
+        target_date, title = _parse_date_query(day)
+        if not target_date:
+            return "无法识别日期，请使用 today、tomorrow、今天、明天或 YYYY-MM-DD。"
+
+        target_id, info, error = await self._resolve_member_info(event, query)
+        if error:
+            return error
+
+        start_bound, end_bound = _day_bounds(target_date)
+        occurrences = _expand_member_occurrences(info, start_bound, end_bound)
+
+        name = info.get("name") or target_id
+        if occurrences:
+            lines = [f"{name} {title}课程："]
+            lines.extend(_format_occurrence_line(item) for item in occurrences)
+            return "\n".join(lines)
+
+        if info.get("events"):
+            return f"{name} {title}没有接下来要上的课程。"
+
+        schedule = info.get("schedule") or "空"
+        return (
+            f"{name} 的课程表不是结构化 .ics 数据，无法按日期展开。"
+            f"\n已保存内容：\n{schedule}"
+        )
+
+    async def _group_current_text(self, event: AstrMessageEvent) -> str:
+        members = await self._get_scope_members(event)
+        if not members:
+            return "当前会话还没有保存任何课程表。"
+
+        now = datetime.now(LOCAL_TZ)
+        start_bound, end_bound = _day_bounds(now.date())
+        names = await self._get_group_member_names(event, members)
+        rows: list[tuple[str, str, str, str]] = []
+        for user_id, info in members.items():
+            if not isinstance(info, dict):
+                continue
+
+            occurrences = _expand_member_occurrences(info, start_bound, end_bound)
+            status, occurrence = _current_or_next(occurrences, now)
+            if not occurrence:
+                continue
+
+            course = occurrence.get("SUMMARY") or "未命名课程"
+            location = occurrence.get("LOCATION")
+            if location:
+                course += f" @ {location}"
+            time_text = f"{occurrence['_start']:%H:%M}-{occurrence['_end']:%H:%M}"
+            name = names.get(user_id) or str(info.get("name") or user_id)
+            rows.append((status, time_text, name, course))
+
+        if not rows:
+            return "当前会话没有可展示的当前或下一节课程。"
+
+        rows.sort(key=lambda row: (row[0] != "正在上", row[1], row[2]))
+        lines = ["群友当前 / 下一节课："]
+        lines.extend(
+            f"{name}：{status} {time_text} {course}"
+            for status, time_text, name, course in rows
+        )
+        return "\n".join(lines)
+
     async def _group_current_image(self, event: AstrMessageEvent) -> str | None:
         members = await self._get_scope_members(event)
         if not members:
@@ -1233,3 +1335,34 @@ class CourseSchedulePlugin(Star):
     async def delete_schedule(self, event: AstrMessageEvent):
         """删除自己的课程表"""
         yield event.plain_result(await self._delete_schedule_text(event))
+
+    @filter.llm_tool(name="query_course_schedule")
+    async def query_course_schedule_tool(self, event: AstrMessageEvent, query: str = ""):
+        """查询当前会话中已保存的完整课程表。按 QQ 号或昵称查询；query 为空时查询发起人的课程表。
+
+        Args:
+            query(string): 成员 QQ 号或昵称关键字。留空表示查询发起人自己的课程表。
+        """
+        yield event.plain_result(await self._show_schedule_text(event, query))
+
+    @filter.llm_tool(name="query_course_schedule_day")
+    async def query_course_schedule_day_tool(
+        self, event: AstrMessageEvent, day: str = "today", query: str = ""
+    ):
+        """查询当前会话中某个成员某天的课程。仅 .ics 导入的课程表可按日期展开。
+
+        Args:
+            day(string): 日期，支持 today、tomorrow、今天、明天或 YYYY-MM-DD。
+            query(string): 成员 QQ 号或昵称关键字。留空表示查询发起人自己的课程表。
+        """
+        yield event.plain_result(await self._member_day_schedule_text(event, query, day))
+
+    @filter.llm_tool(name="list_course_schedules")
+    async def list_course_schedules_tool(self, event: AstrMessageEvent):
+        """列出当前会话中已经保存课程表的成员。"""
+        yield event.plain_result(await self._list_schedules_text(event))
+
+    @filter.llm_tool(name="query_group_current_courses")
+    async def query_group_current_courses_tool(self, event: AstrMessageEvent):
+        """查询当前会话中群友正在上或下一节要上的课程，返回文本摘要。"""
+        yield event.plain_result(await self._group_current_text(event))
