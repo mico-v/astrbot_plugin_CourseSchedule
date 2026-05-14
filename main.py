@@ -33,6 +33,62 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _datetime_to_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.fromtimestamp(timestamp, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            return _parse_timestamp(float(text))
+        except ValueError:
+            return None
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=LOCAL_TZ)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for input_format in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(text, input_format)
+            return parsed.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+    return None
+
+
+def _timestamp_iso(value: Any | None = None) -> str:
+    parsed = _parse_timestamp(value) if value is not None else None
+    return _datetime_to_iso(parsed or datetime.now(timezone.utc))
+
+
 def _empty_store() -> dict[str, Any]:
     return {"version": 1, "groups": {}}
 
@@ -62,26 +118,50 @@ def _scope_label(event: AstrMessageEvent) -> str:
     return f"群 {group_id}" if group_id else "私聊"
 
 
-def _strip_command(message: str, command_names: set[str]) -> str:
-    text = message.strip()
-    if not text:
-        return ""
-
-    parts = text.split(maxsplit=1)
-    first = parts[0]
-    rest = parts[1] if len(parts) > 1 else ""
-    normalized_first = first.lstrip("/／").strip()
-    if normalized_first in command_names:
-        return rest.strip()
-
-    return ""
-
-
 def _format_time(value: str | None) -> str:
     if not value:
         return "未知时间"
 
     return value.replace("T", " ").replace("+00:00", " UTC")
+
+
+def _group_file_updated_at(file_info: dict[str, Any]) -> datetime | None:
+    timestamp_keys = (
+        "modify_time",
+        "modified_time",
+        "update_time",
+        "updated_at",
+        "mtime",
+        "upload_time",
+        "created_at",
+        "create_time",
+        "ctime",
+        "time",
+    )
+    for key in timestamp_keys:
+        parsed = _parse_timestamp(file_info.get(key))
+        if parsed:
+            return parsed
+
+    return None
+
+
+def _local_schedule_updated_at(info: dict[str, Any]) -> datetime | None:
+    return (
+        _parse_timestamp(info.get("schedule_updated_at"))
+        or _parse_timestamp(info.get("content_updated_at"))
+        or _parse_timestamp(info.get("updated_at"))
+    )
+
+
+def _compare_timestamps(left: datetime | None, right: datetime | None) -> int | None:
+    if not left or not right:
+        return None
+
+    delta = (left - right).total_seconds()
+    if abs(delta) <= 2:
+        return 0
+    return 1 if delta > 0 else -1
 
 
 def _unfold_ics_lines(content: str) -> list[str]:
@@ -454,22 +534,38 @@ def _parse_date_query(day: str) -> tuple[date | None, str]:
         return None, ""
 
 
+def _strip_command(message_str: str, commands: set[str]) -> str:
+    text = str(message_str or "").strip()
+    if not text:
+        return ""
+
+    if text[0] in {"/", "／"}:
+        text = text[1:].lstrip()
+
+    for command in sorted(commands, key=len, reverse=True):
+        if text == command:
+            return ""
+        if text.startswith(f"{command} "):
+            return text[len(command) :].strip()
+
+    return text
+
+
 def _help_text() -> str:
     return "\n".join(
         [
             "课程表插件命令：",
-            "/课程表 同步群文件 - 读取群文件中的 .ics 课程表",
+            "/课程表 同步群文件 - 群文件与本地 .ics 双向同步，较新的版本覆盖较旧版本",
             "/课程表 导出 - 将自己的原始 .ics 上传到当前群",
-            "/查看课表 - 查看自己今天接下来要上的课程",
-            "/查看明日课表 - 查看自己明天要上的课程",
+            "/课程表 查看 [昵称或QQ号] - 查看自己或群友的完整课程表",
+            "/课程表 列表 - 列出当前会话已保存课程表成员",
+            "/课程表 保存 <课程表内容> - 手动保存文本课程表",
+            "/课程表 删除 - 删除自己当前会话下的课程表",
+            "/查看课表 - 快速查看自己完整课程表",
+            "/查看明日课表 - 查看自己明天课程",
             "/群友在上什么课 - 群友当前或下一节课图片",
             "/群友明天上什么课 - 群友明日课程图片",
             "/本周上课排行 - 本周群友上课时长排行图片",
-            "/课程表 查看 - 查看自己的课程表",
-            "/课程表 查看 <昵称或QQ号> - 查看当前群内指定同学的课程表",
-            "/课程表 列表 - 查看当前会话已保存课程表的成员",
-            "/课程表 保存 <课程表内容> - 手动保存文本课程表",
-            "/课程表 删除 - 删除自己的课程表",
             "",
             "群文件支持两种放法：",
             "1. 根目录 schedule123456.ics",
@@ -477,14 +573,16 @@ def _help_text() -> str:
             "其中 123456 是 QQ 号。",
             "",
             "兼容短命令：",
-            "/课程表保存 <课程表内容>",
-            "/课程表查看 <昵称或QQ号>",
+            "/课程表同步群文件",
+            "/课程表导出",
+            "/课程表查看",
             "/课程表列表",
+            "/课程表保存",
             "/课程表删除",
             "",
             "示例：",
             "/课程表 同步群文件",
-            "/课程表 查看 123456",
+            "/群友在上什么课",
         ]
     )
 
@@ -505,6 +603,11 @@ def _write_temp_ics(filename: str, content: str) -> str:
     target = temp_dir / filename
     target.write_text(content, encoding="utf-8")
     return str(target)
+
+
+def _write_temp_schedule_ics(user_id: str, content: str) -> tuple[str, str]:
+    filename = f"schedule{user_id}.ics"
+    return filename, _write_temp_ics(filename, content)
 
 
 def _asset_temp_path(filename: str) -> str:
@@ -637,21 +740,6 @@ class CourseSchedulePlugin(Star):
 
         return members
 
-    async def _upsert_schedule(self, event: AstrMessageEvent, content: str) -> None:
-        store = await self._load_store()
-        scope = _scope_id(event)
-        scope_data = store["groups"].setdefault(scope, {"members": {}})
-        members = scope_data.setdefault("members", {})
-
-        user_id = event.get_sender_id()
-        members[user_id] = {
-            "name": event.get_sender_name() or user_id,
-            "schedule": content,
-            "updated_at": _now_iso(),
-            "source": "text",
-        }
-        await self._save_store(store)
-
     async def _upsert_ics_schedule(
         self,
         event: AstrMessageEvent,
@@ -660,8 +748,11 @@ class CourseSchedulePlugin(Star):
         ics_content: str,
         uploader_id: str | None = None,
         name: str | None = None,
+        remote_updated_at: Any | None = None,
     ) -> None:
         events, schedule_text = _parse_schedule_ics(ics_content)
+        now = _now_iso()
+        schedule_updated_at = _timestamp_iso(remote_updated_at)
         store = await self._load_store()
         scope = _scope_id(event)
         scope_data = store["groups"].setdefault(scope, {"members": {}})
@@ -671,7 +762,10 @@ class CourseSchedulePlugin(Star):
         members[user_id] = {
             "name": name or previous.get("name") or user_id,
             "schedule": schedule_text,
-            "updated_at": _now_iso(),
+            "updated_at": now,
+            "schedule_updated_at": schedule_updated_at,
+            "remote_updated_at": schedule_updated_at,
+            "last_synced_at": now,
             "source": "ics",
             "source_file": filename,
             "uploader_id": uploader_id or "",
@@ -681,21 +775,34 @@ class CourseSchedulePlugin(Star):
         }
         await self._save_store(store)
 
-    async def _delete_own_schedule(self, event: AstrMessageEvent) -> bool:
+    async def _mark_schedule_synced(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        source_file: str,
+        remote_updated_at: Any | None = None,
+    ) -> None:
         store = await self._load_store()
         scope_data = store["groups"].get(_scope_id(event))
         if not isinstance(scope_data, dict):
-            return False
+            return
 
         members = scope_data.get("members")
         if not isinstance(members, dict):
-            return False
+            return
 
-        deleted = members.pop(event.get_sender_id(), None) is not None
-        if deleted:
-            await self._save_store(store)
+        info = members.get(user_id)
+        if not isinstance(info, dict):
+            return
 
-        return deleted
+        now = _now_iso()
+        synced_at = _timestamp_iso(remote_updated_at)
+        info["source_file"] = source_file
+        info["schedule_updated_at"] = synced_at
+        info["remote_updated_at"] = synced_at
+        info["last_synced_at"] = now
+        info["updated_at"] = now
+        await self._save_store(store)
 
     async def _resolve_member_info(
         self, event: AstrMessageEvent, query: str = ""
@@ -735,19 +842,9 @@ class CourseSchedulePlugin(Star):
             if normalized_query and not _is_own_query(normalized_query):
                 return None, None, f"没有找到“{normalized_query}”的课程表。"
 
-            return None, None, "你还没有保存课程表，先使用 /课程表 保存 <内容>。"
+            return None, None, "你还没有保存课程表，请先上传 .ics 并使用 /课程表 同步群文件。"
 
         return target_id, info, None
-
-    async def _save_schedule_text(self, event: AstrMessageEvent, content: str) -> str:
-        if not content:
-            return "请在命令后输入课程表内容，例如：/课程表 保存 周一 1-2 高数 @ 教一101"
-
-        await self._upsert_schedule(event, content)
-        logger.info(
-            f"Saved course schedule for user {event.get_sender_id()} in {_scope_id(event)}"
-        )
-        return f"已保存你在{_scope_label(event)}的课程表。"
 
     async def _show_schedule_text(self, event: AstrMessageEvent, query: str = "") -> str:
         target_id, info, error = await self._resolve_member_info(event, query)
@@ -771,11 +868,53 @@ class CourseSchedulePlugin(Star):
         ]
         return f"{_scope_label(event)}已保存 {len(lines)} 份课程表：\n" + "\n".join(lines)
 
-    async def _delete_schedule_text(self, event: AstrMessageEvent) -> str:
-        if await self._delete_own_schedule(event):
-            return "已删除你的课程表。"
+    async def _save_manual_schedule_text(
+        self, event: AstrMessageEvent, schedule_text: str
+    ) -> str:
+        content = str(schedule_text or "").strip()
+        if not content:
+            return "请提供要保存的课程表内容，例如：/课程表 保存 周一 08:00 高数。"
 
-        return "你还没有保存课程表。"
+        now = _now_iso()
+        user_id = event.get_sender_id()
+        store = await self._load_store()
+        scope = _scope_id(event)
+        scope_data = store["groups"].setdefault(scope, {"members": {}})
+        members = scope_data.setdefault("members", {})
+        previous = members.get(user_id, {})
+        members[user_id] = {
+            "name": event.get_sender_name() or previous.get("name") or user_id,
+            "schedule": content,
+            "updated_at": now,
+            "content_updated_at": now,
+            "last_synced_at": now,
+            "source": "manual",
+            "source_file": "",
+            "uploader_id": user_id,
+            "event_count": 0,
+            "events": [],
+            "ics": "",
+        }
+        await self._save_store(store)
+        return "已保存文本课程表。"
+
+    async def _delete_own_schedule_text(self, event: AstrMessageEvent) -> str:
+        store = await self._load_store()
+        scope = _scope_id(event)
+        scope_data = store["groups"].get(scope)
+        if not isinstance(scope_data, dict):
+            return "你还没有保存课程表。"
+
+        members = scope_data.get("members")
+        if not isinstance(members, dict):
+            return "你还没有保存课程表。"
+
+        removed = members.pop(event.get_sender_id(), None)
+        if removed is None:
+            return "你还没有保存课程表。"
+
+        await self._save_store(store)
+        return "已删除你在当前会话中的课程表。"
 
     def _is_onebot_event(self, event: AstrMessageEvent) -> bool:
         return event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot")
@@ -922,6 +1061,42 @@ class CourseSchedulePlugin(Star):
 
         return str(url)
 
+    async def _upload_schedule_file(
+        self, event: AstrMessageEvent, group_id: str, user_id: str, ics_content: str
+    ) -> str:
+        filename, local_path = await asyncio.to_thread(
+            _write_temp_schedule_ics, user_id, ics_content
+        )
+        await self._call_onebot_api(
+            event,
+            "upload_group_file",
+            group_id=int(group_id),
+            file=local_path,
+            name=filename,
+        )
+        return filename
+
+    async def _download_group_schedule(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        file_info: dict[str, Any],
+        remote_updated_at: datetime | None,
+    ) -> None:
+        url = await self._get_group_file_url(event, group_id, file_info)
+        ics_content = await asyncio.to_thread(_download_text, url)
+        member_name = await self._get_group_member_name(event, group_id, user_id)
+        await self._upsert_ics_schedule(
+            event,
+            user_id=user_id,
+            filename=_display_group_file_path(file_info),
+            ics_content=ics_content,
+            uploader_id=str(file_info.get("uploader") or file_info.get("user_id") or ""),
+            name=member_name,
+            remote_updated_at=remote_updated_at,
+        )
+
     async def _sync_group_files_text(self, event: AstrMessageEvent) -> str:
         group_id = event.get_group_id()
         if not group_id:
@@ -940,42 +1115,105 @@ class CourseSchedulePlugin(Star):
             if _extract_schedule_user_id(filename, folder_path):
                 matched.append(file_info)
 
-        if not matched:
-            return "没有找到根目录 schedule<QQ号>.ics 或 schedule/<QQ号>.ics。"
-
-        success: list[str] = []
-        failed: list[str] = []
+        members = await self._get_scope_members(event)
+        remote_by_user: dict[str, dict[str, Any]] = {}
         for file_info in matched:
-            filename = _file_name(file_info)
-            folder_path = str(file_info.get("_folder_path") or "")
-            display_path = _display_group_file_path(file_info)
-            user_id = _extract_schedule_user_id(filename, folder_path)
+            user_id = _extract_schedule_user_id(
+                _file_name(file_info), str(file_info.get("_folder_path") or "")
+            )
             if not user_id:
                 continue
 
+            current = remote_by_user.get(user_id)
+            if not current:
+                remote_by_user[user_id] = file_info
+                continue
+
+            current_time = _group_file_updated_at(current)
+            next_time = _group_file_updated_at(file_info)
+            if _compare_timestamps(next_time, current_time) == 1 or (
+                next_time and not current_time
+            ):
+                remote_by_user[user_id] = file_info
+
+        downloaded: list[str] = []
+        uploaded: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+        processed_users: set[str] = set()
+
+        for user_id, file_info in remote_by_user.items():
+            display_path = _display_group_file_path(file_info)
+            processed_users.add(user_id)
+            remote_updated_at = _group_file_updated_at(file_info)
+            local_info = members.get(user_id)
+            local_updated_at = (
+                _local_schedule_updated_at(local_info)
+                if isinstance(local_info, dict)
+                else None
+            )
+            comparison = _compare_timestamps(local_updated_at, remote_updated_at)
+
             try:
-                url = await self._get_group_file_url(event, group_id, file_info)
-                ics_content = await asyncio.to_thread(_download_text, url)
-                member_name = await self._get_group_member_name(event, group_id, user_id)
-                await self._upsert_ics_schedule(
-                    event,
-                    user_id=user_id,
-                    filename=display_path,
-                    ics_content=ics_content,
-                    uploader_id=str(
-                        file_info.get("uploader") or file_info.get("user_id") or ""
-                    ),
-                    name=member_name,
-                )
-                success.append(f"{display_path} -> {user_id}")
+                if (
+                    comparison == 1
+                    and isinstance(local_info, dict)
+                    and local_info.get("ics")
+                ):
+                    uploaded_name = await self._upload_schedule_file(
+                        event, group_id, user_id, str(local_info["ics"])
+                    )
+                    await self._mark_schedule_synced(
+                        event, user_id, uploaded_name, datetime.now(timezone.utc)
+                    )
+                    uploaded.append(f"{user_id} -> {uploaded_name}")
+                elif comparison == 0 and isinstance(local_info, dict):
+                    await self._mark_schedule_synced(
+                        event, user_id, display_path, remote_updated_at
+                    )
+                    skipped.append(f"{display_path} 已是最新")
+                else:
+                    await self._download_group_schedule(
+                        event, group_id, user_id, file_info, remote_updated_at
+                    )
+                    downloaded.append(f"{display_path} -> {user_id}")
             except Exception as exc:
                 logger.error(f"Failed to sync group file {display_path}: {exc}")
                 failed.append(f"{display_path}: {exc}")
 
-        lines = [f"群文件同步完成：成功 {len(success)} 个，失败 {len(failed)} 个。"]
-        if success:
-            lines.append("已导入：")
-            lines.extend(success[:20])
+        for user_id, local_info in members.items():
+            if user_id in processed_users or not isinstance(local_info, dict):
+                continue
+            ics_content = local_info.get("ics")
+            if not ics_content:
+                continue
+
+            try:
+                uploaded_name = await self._upload_schedule_file(
+                    event, group_id, user_id, str(ics_content)
+                )
+                await self._mark_schedule_synced(
+                    event, user_id, uploaded_name, datetime.now(timezone.utc)
+                )
+                uploaded.append(f"{user_id} -> {uploaded_name}")
+            except Exception as exc:
+                logger.error(f"Failed to upload local schedule for {user_id}: {exc}")
+                failed.append(f"{user_id}: {exc}")
+
+        lines = [
+            "群文件双向同步完成："
+            f"下载 {len(downloaded)} 个，上传 {len(uploaded)} 个，"
+            f"跳过 {len(skipped)} 个，失败 {len(failed)} 个。"
+        ]
+        if downloaded:
+            lines.append("已下载：")
+            lines.extend(downloaded[:20])
+        if uploaded:
+            lines.append("已上传：")
+            lines.extend(uploaded[:20])
+        if skipped:
+            lines.append("已跳过：")
+            lines.extend(skipped[:10])
         if failed:
             lines.append("失败：")
             lines.extend(failed[:10])
@@ -987,51 +1225,30 @@ class CourseSchedulePlugin(Star):
         if not group_id:
             return "只能在群聊中上传课程表文件。"
 
-        members = await self._get_scope_members(event)
-        info = members.get(event.get_sender_id())
-        if not info:
-            return "你还没有保存课程表。请先上传 schedule<QQ号>.ics 并同步，或使用 /课程表 保存。"
+        target_id, info, error = await self._resolve_member_info(event)
+        if error:
+            return "你还没有保存课程表。请先上传 schedule<QQ号>.ics 并同步。"
 
         ics_content = info.get("ics")
         if not ics_content:
             return "当前课程表不是从 .ics 导入的，无法导出原始 .ics。"
 
-        filename = f"schedule{event.get_sender_id()}.ics"
-        local_path = await asyncio.to_thread(_write_temp_ics, filename, ics_content)
+        filename = f"schedule{target_id or event.get_sender_id()}.ics"
         try:
-            await self._call_onebot_api(
+            filename = await self._upload_schedule_file(
+                event, group_id, target_id or event.get_sender_id(), str(ics_content)
+            )
+            await self._mark_schedule_synced(
                 event,
-                "upload_group_file",
-                group_id=int(group_id),
-                file=local_path,
-                name=filename,
+                target_id or event.get_sender_id(),
+                filename,
+                datetime.now(timezone.utc),
             )
         except Exception as exc:
             logger.error(f"Failed to upload group file {filename}: {exc}")
             return f"上传群文件失败：{exc}"
 
         return f"已上传 {filename} 到当前群文件。"
-
-    async def _own_day_schedule_text(
-        self, event: AstrMessageEvent, target_date: date, title: str
-    ) -> str:
-        members = await self._get_scope_members(event)
-        info = members.get(event.get_sender_id())
-        if not info:
-            return "你还没有保存课程表。请先上传 .ics 并使用 /课程表 同步群文件。"
-
-        start_bound, end_bound = _day_bounds(target_date)
-        occurrences = _expand_member_occurrences(info, start_bound, end_bound)
-        now = datetime.now(LOCAL_TZ)
-        if target_date == now.date():
-            occurrences = [item for item in occurrences if item["_end"] > now]
-
-        if not occurrences:
-            return f"{title}没有接下来要上的课程。"
-
-        lines = [f"{title}课程："]
-        lines.extend(_format_occurrence_line(item) for item in occurrences)
-        return "\n".join(lines)
 
     async def _member_day_schedule_text(
         self, event: AstrMessageEvent, query: str, day: str
@@ -1109,6 +1326,8 @@ class CourseSchedulePlugin(Star):
         rows: list[dict[str, str]] = []
         names = await self._get_group_member_names(event, members)
         for user_id, info in members.items():
+            if not isinstance(info, dict):
+                continue
             occurrences = _expand_member_occurrences(info, start_bound, end_bound)
             status, occurrence = _current_or_next(occurrences, now)
             if not occurrence:
@@ -1142,6 +1361,8 @@ class CourseSchedulePlugin(Star):
         rows: list[dict[str, str]] = []
         names = await self._get_group_member_names(event, members)
         for user_id, info in members.items():
+            if not isinstance(info, dict):
+                continue
             occurrences = _expand_member_occurrences(info, start_bound, end_bound)
             if not occurrences:
                 continue
@@ -1175,6 +1396,8 @@ class CourseSchedulePlugin(Star):
         rows: list[dict[str, str]] = []
         names = await self._get_group_member_names(event, members)
         for user_id, info in members.items():
+            if not isinstance(info, dict):
+                continue
             occurrences = _expand_member_occurrences(info, start_bound, end_bound)
             if not occurrences:
                 continue
@@ -1204,10 +1427,10 @@ class CourseSchedulePlugin(Star):
         rest = _strip_command(event.message_str, {"课程表", "课表"})
         parts = rest.split(maxsplit=1)
         action = parts[0].strip() if parts else ""
-        payload = parts[1].strip() if len(parts) > 1 else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
 
         if not action:
-            yield event.plain_result(await self._show_schedule_text(event))
+            yield event.plain_result(_help_text())
             return
 
         if action in {"帮助", "help"}:
@@ -1222,32 +1445,20 @@ class CourseSchedulePlugin(Star):
             yield event.plain_result(await self._export_own_ics_text(event))
             return
 
-        if action in {"保存", "设置", "save", "set"}:
-            yield event.plain_result(await self._save_schedule_text(event, payload))
-            return
-
-        if action in {"查看", "查询", "show", "get"}:
-            yield event.plain_result(await self._show_schedule_text(event, payload))
-            return
-
-        if action in {"今天", "今日"}:
-            today = datetime.now(LOCAL_TZ).date()
-            yield event.plain_result(await self._own_day_schedule_text(event, today, "今天"))
-            return
-
-        if action in {"明天", "明日"}:
-            tomorrow = datetime.now(LOCAL_TZ).date() + timedelta(days=1)
-            yield event.plain_result(
-                await self._own_day_schedule_text(event, tomorrow, "明天")
-            )
+        if action in {"查看", "query", "show"}:
+            yield event.plain_result(await self._show_schedule_text(event, arg))
             return
 
         if action in {"列表", "list"}:
             yield event.plain_result(await self._list_schedules_text(event))
             return
 
+        if action in {"保存", "save"}:
+            yield event.plain_result(await self._save_manual_schedule_text(event, arg))
+            return
+
         if action in {"删除", "delete", "remove"}:
-            yield event.plain_result(await self._delete_schedule_text(event))
+            yield event.plain_result(await self._delete_own_schedule_text(event))
             return
 
         yield event.plain_result("未知课程表命令，发送 /课程表 帮助 查看用法。")
@@ -1258,18 +1469,14 @@ class CourseSchedulePlugin(Star):
         yield event.plain_result(_help_text())
 
     @filter.command("查看课表")
-    async def today_schedule(self, event: AstrMessageEvent):
-        """显示自己今天接下来要上的课程"""
-        today = datetime.now(LOCAL_TZ).date()
-        yield event.plain_result(await self._own_day_schedule_text(event, today, "今天"))
+    async def view_schedule(self, event: AstrMessageEvent):
+        """快速查看自己完整课程表"""
+        yield event.plain_result(await self._show_schedule_text(event))
 
     @filter.command("查看明日课表", alias={"查看明天课表"})
-    async def tomorrow_schedule(self, event: AstrMessageEvent):
-        """显示自己明天要上的课程"""
-        tomorrow = datetime.now(LOCAL_TZ).date() + timedelta(days=1)
-        yield event.plain_result(
-            await self._own_day_schedule_text(event, tomorrow, "明天")
-        )
+    async def view_tomorrow_schedule(self, event: AstrMessageEvent):
+        """快速查看自己明天课程"""
+        yield event.plain_result(await self._member_day_schedule_text(event, "", "tomorrow"))
 
     @filter.command("群友在上什么课")
     async def group_current_schedule(self, event: AstrMessageEvent):
@@ -1308,33 +1515,27 @@ class CourseSchedulePlugin(Star):
         """将自己的原始 .ics 上传到群文件"""
         yield event.plain_result(await self._export_own_ics_text(event))
 
-    @filter.command("课程表保存", alias={"保存课程表", "保存课表", "课表保存"})
-    async def save_schedule(self, event: AstrMessageEvent):
-        """保存或覆盖自己的课程表"""
-        content = _strip_command(
-            event.message_str,
-            {"课程表保存", "保存课程表", "保存课表", "课表保存"},
-        )
-        yield event.plain_result(await self._save_schedule_text(event, content))
-
-    @filter.command("课程表查看", alias={"查看课程表", "查看课表", "课表查看"})
+    @filter.command("课程表查看", alias={"课表查看"})
     async def show_schedule(self, event: AstrMessageEvent):
-        """查看自己或当前群内指定成员的课程表"""
-        query = _strip_command(
-            event.message_str,
-            {"课程表查看", "查看课程表", "查看课表", "课表查看"},
-        )
+        """查询自己或群友的完整课程表"""
+        query = _strip_command(event.message_str, {"课程表查看", "课表查看"}).strip()
         yield event.plain_result(await self._show_schedule_text(event, query))
 
     @filter.command("课程表列表", alias={"课表列表"})
     async def list_schedules(self, event: AstrMessageEvent):
-        """查看当前会话已保存课程表的成员"""
+        """列出当前会话已保存课程表成员"""
         yield event.plain_result(await self._list_schedules_text(event))
 
-    @filter.command("课程表删除", alias={"删除课程表", "删除课表", "课表删除"})
+    @filter.command("课程表保存", alias={"课表保存"})
+    async def save_schedule(self, event: AstrMessageEvent):
+        """手动保存文本课程表"""
+        content = _strip_command(event.message_str, {"课程表保存", "课表保存"}).strip()
+        yield event.plain_result(await self._save_manual_schedule_text(event, content))
+
+    @filter.command("课程表删除", alias={"课表删除"})
     async def delete_schedule(self, event: AstrMessageEvent):
-        """删除自己的课程表"""
-        yield event.plain_result(await self._delete_schedule_text(event))
+        """删除自己在当前会话中的课程表"""
+        yield event.plain_result(await self._delete_own_schedule_text(event))
 
     @filter.llm_tool(name="query_course_schedule")
     async def query_course_schedule_tool(self, event: AstrMessageEvent, query: str = ""):
