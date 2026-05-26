@@ -17,7 +17,7 @@ from .files import (
     _join_folder_path,
     _write_temp_schedule_ics,
 )
-from .ics import _parse_schedule_ics
+from .ics import _format_ics_schedule, _parse_schedule_ics
 from .occurrences import (
     _current_or_next,
     _day_bounds,
@@ -27,6 +27,8 @@ from .occurrences import (
     _week_bounds,
 )
 from .render import _draw_rows_image
+from .sql_edit import apply_sql_edit_to_member
+from .sql_query import execute_course_schedule_sql
 from .store import (
     _compare_timestamps,
     _empty_store,
@@ -202,7 +204,7 @@ class CourseScheduleBase:
     ) -> str:
         content = str(schedule_text or "").strip()
         if not content:
-            return "请提供要保存的课程表内容，例如：/课程表 保存 周一 08:00 高数。"
+            return "请提供要保存的课程表内容。"
 
         now = _now_iso()
         user_id = event.get_sender_id()
@@ -244,6 +246,118 @@ class CourseScheduleBase:
 
         await self._save_store(store)
         return "已删除你在当前会话中的课程表。"
+
+    async def _get_local_ics_text(self, event: AstrMessageEvent, query: str = "") -> str:
+        target_id, info, error = await self._resolve_member_info(event, query)
+        if error:
+            return error
+
+        ics_content = str(info.get("ics") or "")
+        if not ics_content:
+            return "当前课程表不是 .ics 导入的数据，无法读取本地 .ics 内容。"
+
+        name = info.get("name") or target_id
+        updated_at = _format_time(info.get("updated_at"))
+        source_file = info.get("source_file") or f"schedule{target_id}.ics"
+        return (
+            f"{name}({target_id}) 的本地 .ics 内容如下。\n"
+            f"来源文件：{source_file}\n"
+            f"本地更新时间：{updated_at}\n\n"
+            f"{ics_content}"
+        )
+
+    async def _replace_local_ics_text(
+        self, event: AstrMessageEvent, ics_content: str, query: str = ""
+    ) -> str:
+        content = str(ics_content or "").strip()
+        if not content:
+            return "新的 .ics 内容为空，未修改。"
+
+        try:
+            events, schedule_text = _parse_schedule_ics(content)
+        except Exception as exc:
+            return f"解析新的 .ics 内容失败，未修改：{exc}"
+
+        if not events:
+            return "新的 .ics 内容中没有可解析的 VEVENT，未修改。"
+
+        store = await self._load_store()
+        scope_data = store["groups"].get(_scope_id(event))
+        if not isinstance(scope_data, dict):
+            return "当前会话还没有保存任何课程表。"
+
+        members = scope_data.get("members")
+        if not isinstance(members, dict):
+            return "当前会话还没有保存任何课程表。"
+
+        target_id, _info, error = await self._resolve_member_info(event, query)
+        if error:
+            return error
+
+        info = members.get(target_id)
+        if not isinstance(info, dict):
+            return "没有找到要修改的本地课程表。"
+        if not info.get("ics"):
+            return "当前课程表不是 .ics 导入的数据，不能用 .ics 替换。"
+
+        now = _now_iso()
+        info["ics"] = content
+        info["events"] = events
+        info["schedule"] = schedule_text
+        info["event_count"] = len(events)
+        info["source"] = "ics"
+        info["updated_at"] = now
+        info["schedule_updated_at"] = now
+        info["content_updated_at"] = now
+        info["last_modified_by"] = event.get_sender_id()
+        info["last_modified_at"] = now
+        await self._save_store(store)
+
+        name = info.get("name") or target_id
+        return (
+            f"已更新 {name}({target_id}) 的本地 .ics 课程表，解析到 {len(events)} 个事件。"
+            "远端群文件尚未同步；请使用 /同步课表 按时间戳上传本地较新版本。"
+        )
+
+    async def _edit_local_schedule_sql_text(
+        self, event: AstrMessageEvent, sql: str, query: str = ""
+    ) -> str:
+        store = await self._load_store()
+        scope_data = store["groups"].get(_scope_id(event))
+        if not isinstance(scope_data, dict):
+            return "当前会话还没有保存任何课程表。"
+
+        members = scope_data.get("members")
+        if not isinstance(members, dict):
+            return "当前会话还没有保存任何课程表。"
+
+        target_id, _info, error = await self._resolve_member_info(event, query)
+        if error:
+            return error
+
+        info = members.get(target_id)
+        if not isinstance(info, dict):
+            return "没有找到要修改的本地课程表。"
+        if not info.get("ics"):
+            return "当前课程表不是 .ics 导入的数据，不能用 SQL 修改。"
+
+        try:
+            updated_info = apply_sql_edit_to_member(info, sql)
+        except ValueError as exc:
+            return str(exc)
+
+        changes = updated_info.pop("_sql_edit_changes", 0)
+        updated_info["schedule"] = _format_ics_schedule(updated_info["events"])
+        updated_info["last_modified_by"] = event.get_sender_id()
+        members[target_id] = updated_info
+        await self._save_store(store)
+
+        name = updated_info.get("name") or target_id
+        return (
+            f"已用 SQL 修改 {name}({target_id}) 的本地课程表，影响 {changes} 条，"
+            f"当前共有 {updated_info.get('event_count', 0)} 个事件。"
+            "远端群文件尚未同步；请使用 /同步课表 按时间戳上传本地较新版本。"
+        )
 
     def _is_onebot_event(self, event: AstrMessageEvent) -> bool:
         return event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot")
@@ -391,19 +505,48 @@ class CourseScheduleBase:
         return str(url)
 
     async def _upload_schedule_file(
-        self, event: AstrMessageEvent, group_id: str, user_id: str, ics_content: str
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        ics_content: str,
+        target_file_info: dict[str, Any] | None = None,
     ) -> str:
-        filename, local_path = await asyncio.to_thread(
+        default_filename, local_path = await asyncio.to_thread(
             _write_temp_schedule_ics, user_id, ics_content
         )
-        await self._call_onebot_api(
-            event,
-            "upload_group_file",
-            group_id=int(group_id),
-            file=local_path,
-            name=filename,
+        filename = (
+            _file_name(target_file_info)
+            if isinstance(target_file_info, dict) and _file_name(target_file_info)
+            else default_filename
         )
-        return filename
+        params: dict[str, Any] = {
+            "group_id": int(group_id),
+            "file": local_path,
+            "name": filename,
+        }
+        folder_id = (
+            str(target_file_info.get("_folder_id") or "")
+            if isinstance(target_file_info, dict)
+            else ""
+        )
+        if folder_id:
+            params["folder"] = folder_id
+
+        try:
+            await self._call_onebot_api(event, "upload_group_file", **params)
+        except Exception:
+            if "folder" not in params:
+                raise
+            params.pop("folder", None)
+            await self._call_onebot_api(event, "upload_group_file", **params)
+
+        folder_path = (
+            str(target_file_info.get("_folder_path") or "").strip("/")
+            if isinstance(target_file_info, dict)
+            else ""
+        )
+        return f"{folder_path}/{filename}" if folder_path else filename
 
     async def _download_group_schedule(
         self,
@@ -490,7 +633,7 @@ class CourseScheduleBase:
                     and local_info.get("ics")
                 ):
                     uploaded_name = await self._upload_schedule_file(
-                        event, group_id, user_id, str(local_info["ics"])
+                        event, group_id, user_id, str(local_info["ics"]), file_info
                     )
                     await self._mark_schedule_synced(
                         event, user_id, uploaded_name, datetime.now(timezone.utc)
@@ -645,6 +788,23 @@ class CourseScheduleBase:
         )
         return "\n".join(lines)
 
+    async def _query_schedule_sql_text(
+        self, event: AstrMessageEvent, sql: str, time_range: str = "today"
+    ) -> str:
+        members = await self._get_scope_members(event)
+        if not members:
+            return "当前会话还没有保存任何课程表。"
+
+        names = await self._get_group_member_names(event, members)
+        return await asyncio.to_thread(
+            execute_course_schedule_sql,
+            members,
+            names,
+            sql,
+            time_range,
+            datetime.now(LOCAL_TZ),
+        )
+
     async def _group_current_image(self, event: AstrMessageEvent) -> str | None:
         members = await self._get_scope_members(event)
         if not members:
@@ -679,6 +839,45 @@ class CourseScheduleBase:
 
         rows.sort(key=lambda row: (row["status"] != "正在上", row["time"], row["name"]))
         return _draw_rows_image("群友当前 / 下一节课", rows, "group_current.png")
+
+    async def _group_today_image(self, event: AstrMessageEvent) -> str | None:
+        members = await self._get_scope_members(event)
+        if not members:
+            return None
+
+        now = datetime.now(LOCAL_TZ)
+        start_bound, end_bound = _day_bounds(now.date())
+        rows: list[dict[str, str]] = []
+        names = await self._get_group_member_names(event, members)
+        for user_id, info in members.items():
+            if not isinstance(info, dict):
+                continue
+            occurrences = _expand_member_occurrences(info, start_bound, end_bound)
+            for occurrence in occurrences:
+                course = occurrence.get("SUMMARY") or "未命名课程"
+                location = occurrence.get("LOCATION")
+                if location:
+                    course += f" @ {location}"
+
+                status = "今天"
+                if occurrence["_start"] <= now < occurrence["_end"]:
+                    status = "正在上"
+                elif occurrence["_end"] <= now:
+                    status = "已结束"
+
+                rows.append(
+                    {
+                        "user_id": user_id,
+                        "name": names.get(user_id) or str(info.get("name") or user_id),
+                        "subtitle": user_id,
+                        "status": status,
+                        "course": course,
+                        "time": f"{occurrence['_start']:%H:%M}-{occurrence['_end']:%H:%M}",
+                    }
+                )
+
+        rows.sort(key=lambda row: (row["time"], row["name"], row["course"]))
+        return _draw_rows_image(f"今日课程表 {now:%Y-%m-%d}", rows, "group_today.png")
 
     async def _group_tomorrow_image(self, event: AstrMessageEvent) -> str | None:
         members = await self._get_scope_members(event)

@@ -1,6 +1,6 @@
 # astrbot_plugin_course_schedule
 
-AstrBot 课程表插件，用于从 QQ 群文件中的 `.ics` 课程表同步数据，并在群聊中查看、列出和导出课程表。
+AstrBot 课程表插件，用于从 QQ 群文件中的 `.ics` 课程表同步数据，并在群聊中生成今日课程表图片。群文件同步通过指令触发；AI 通过 SQL 查询和修改本地结构化课程，插件自动更新本地 `.ics` 内容，后续同步指令按时间戳上传较新的本地版本。
 
 ## 功能
 
@@ -8,18 +8,11 @@ AstrBot 课程表插件，用于从 QQ 群文件中的 `.ics` 课程表同步数
 - 从群文件 `schedule/` 文件夹读取 `<QQ号>.ics`。
 - 解析 iCalendar `.ics` 文件中的 `VEVENT` 课程事件。
 - 按群号和 QQ 号保存每个人的课程表。
-- 查看自己的课程表。
-- 查看自己今天接下来要上的课程。
-- 查看自己明天要上的课程。
-- 在当前群聊中按昵称或 QQ 号查询他人的课程表。
-- 生成群友当前/下一节课图片。
-- 生成群友明日课程图片。
-- 生成本周上课时长和节数排行榜图片。
+- 生成当前会话今日课程表图片。
+- 通过指令按时间戳双向同步群文件课程表，本地较新时会上传到对应群文件。
+- 向 AI 暴露只读 SQL 查询工具，可查询不同人、不同时间范围的课程和统计结果。
+- 向 AI 暴露 SQL 修改工具，可修改本地课程事件并自动重建本地 `.ics`。
 - 图片渲染内置 Noto Sans CJK SC 中文字体。
-- 列出当前会话已保存课程表的成员。
-- 将自己的原始 `.ics` 上传回当前群文件。
-- 手动保存文本课程表作为兜底。
-- 删除自己的课程表。
 
 课程表数据通过 AstrBot 插件 KV 存储保存，不写入插件源码目录。
 
@@ -46,70 +39,120 @@ schedule123456789.ics
 schedule/123456789.ics
 ```
 
-然后在群里发送：
+同步操作通过聊天指令触发：
 
 ```text
-/课程表 同步群文件
+/同步课表
 ```
 
-插件会通过 OneBot 扩展 API 读取群文件列表和文件夹，下载符合命名规则的 `.ics` 文件，解析后按 QQ 号保存。
+插件会通过 OneBot 扩展 API 读取群文件列表和文件夹，下载符合命名规则的 `.ics` 文件。同步按时间戳比较：
 
-## 命令
+- 远端较新：下载群文件并覆盖本地缓存。
+- 本地较新：上传本地 `.ics` 到对应群文件。
+- 时间相同：只更新时间戳记录并跳过。
+
+AI 通过 SQL 修改本地课程后会刷新本地 `schedule_updated_at` 并重建本地 `.ics`，此时再执行 `/同步课表` 会把本地较新的版本上传到群文件。
+
+## 聊天命令
+
+插件保留两个面向聊天的指令：
 
 ```text
-/课程表帮助
-/课程表
-/课程表 同步群文件
-/课程表 导出
-/查看课表
-/查看明日课表
-/群友在上什么课
-/群友明天上什么课
-/本周上课排行
-/课程表 保存 <课程表内容>
-/课程表 查看
-/课程表 查看 <昵称或QQ号>
-/课程表 列表
-/课程表 删除
-/课程表同步群文件
-/课程表导出
-/课程表保存 <课程表内容>
-/课程表查看
-/课程表查看 <昵称或QQ号>
-/课程表列表
-/课程表删除
+/今日课表
+/同步课表
 ```
+
+`/今日课表` 生成当前会话今日课程表图片。`/同步课表` 按时间戳同步当前群的 `.ics` 课程表文件。
 
 ## AI 工具调用
 
-插件会向 AstrBot 注册以下 LLM tools，供模型在对话中按需查询已保存的课程表：
+插件向 AstrBot 注册以下 LLM tools。工具均返回字符串给模型，不会直接向聊天窗口发送文本结果。
 
 ```text
-query_course_schedule(query="")
-query_course_schedule_day(day="today", query="")
-list_course_schedules()
-query_group_current_courses()
+query_course_schedule_sql(sql, time_range="today")
+edit_local_course_schedule_sql(sql, query="")
 ```
 
-`query` 支持 QQ 号或昵称关键字，留空表示查询发起人自己。`day` 支持 `today`、`tomorrow`、
-`今天`、`明天` 或 `YYYY-MM-DD`。按日期查询需要课程表来自 `.ics` 导入；手动文本保存的课程表会返回原始文本。
+AI 工具不负责同步、上传群文件，也不直接操作 `.ics` 文件文本。修改流程是：模型先用查询 SQL 找到要改的课程，再用修改 SQL 更新本地课程事件；插件会自动重建本地 `.ics`，用户再发送 `/同步课表` 上传本地较新的版本。
 
-## 示例
+### SQL 查询工具
+
+`query_course_schedule_sql` 会把指定时间范围内展开后的课程事件放入内存 SQLite，只允许执行一条 `SELECT` 查询。
+
+可用表：
 
 ```text
-/课程表 同步群文件
+members(user_id, name, source, updated_at, schedule_updated_at, source_file, event_count, schedule_text)
+courses(user_id, name, course, location, description, start_time, end_time, date, weekday, weekday_name, start_clock, end_clock, duration_minutes, status, source_file, rrule)
 ```
 
+`time_range` 支持：
+
 ```text
-/课程表
-/查看课表
-/查看明日课表
-/群友在上什么课
-/群友明天上什么课
-/本周上课排行
-/课程表 查看 张三
-/课程表 查看 123456789
-/课程表 列表
+today
+tomorrow
+yesterday
+本周
+下周
+本月
+YYYY-MM-DD
+YYYY-MM-DD..YYYY-MM-DD
+```
+
+查询示例：
+
+```sql
+SELECT name, start_clock, end_clock, course, location
+FROM courses
+WHERE date = '2026-05-26'
+ORDER BY start_time
+```
+
+```sql
+SELECT name, COUNT(*) AS course_count, ROUND(SUM(duration_minutes) / 60.0, 1) AS hours
+FROM courses
+GROUP BY user_id, name
+ORDER BY hours DESC
+```
+
+```sql
+SELECT name, course, start_time, end_time
+FROM courses
+WHERE name LIKE '%张三%' AND status IN ('current', 'future')
+ORDER BY start_time
+LIMIT 10
+```
+
+### SQL 修改工具
+
+`edit_local_course_schedule_sql` 只允许修改当前会话本地保存的结构化 `.ics` 课程表，不会同步或上传群文件。
+
+可修改表：
+
+```text
+local_courses(id, course, location, description, dtstart, dtend, dtstart_tzid, dtend_tzid, rrule)
+```
+
+限制：
+
+- 只支持一条 `UPDATE`、`INSERT` 或 `DELETE`。
+- 修改或删除已有课程时使用 `WHERE id=...` 精确指定。
+- `dtstart` / `dtend` 使用 iCalendar 时间格式，例如 `20260526T090000`。
+- 修改成功后会重建本地 `.ics`，刷新本地时间戳，但不操作群文件。
+
+修改示例：
+
+```sql
+UPDATE local_courses SET course='高等数学', location='A101' WHERE id=2
+```
+
+```sql
+INSERT INTO local_courses(course, location, dtstart, dtend)
+VALUES ('高等数学', 'A101', '20260526T090000', '20260526T103000')
+```
+
+```sql
+DELETE FROM local_courses WHERE id=3
 ```
 
 ## 平台要求
@@ -128,7 +171,7 @@ query_group_current_courses()
 1. 将本仓库放到 AstrBot 的 `data/plugins/astrbot_plugin_course_schedule` 目录下。
 2. 使用 aiocqhttp / OneBot v11 平台，并确保协议端支持群文件 API。
 3. 在 AstrBot WebUI 插件管理中重载插件。
-4. 在群聊或私聊中发送命令测试。
+4. 在群聊或私聊中发送 `/今日课表` 测试图片生成，发送 `/同步课表` 测试群文件同步，或用自然语言请求机器人查询/修改本地课程表。
 
 ## 参考
 
