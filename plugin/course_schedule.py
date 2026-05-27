@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from .constants import LOCAL_TZ, STORE_KEY
+from .constants import LOCAL_TZ, SCHEDULE_FOLDER_NAME, STORE_KEY
 from .files import (
     _display_group_file_path,
     _download_text,
     _extract_schedule_user_id,
     _file_name,
     _folder_name,
+    _inline_file_uris,
+    _is_normalized_schedule_file,
     _join_folder_path,
+    _local_file_uri,
+    _normalized_schedule_filename,
+    _normalized_schedule_path,
     _write_temp_schedule_ics,
 )
 from .ics import _format_ics_schedule, _parse_schedule_ics
@@ -258,7 +264,7 @@ class CourseScheduleBase:
 
         name = info.get("name") or target_id
         updated_at = _format_time(info.get("updated_at"))
-        source_file = info.get("source_file") or f"schedule{target_id}.ics"
+        source_file = info.get("source_file") or _normalized_schedule_path(target_id)
         return (
             f"{name}({target_id}) 的本地 .ics 内容如下。\n"
             f"来源文件：{source_file}\n"
@@ -430,23 +436,42 @@ class CourseScheduleBase:
     def _extract_folder_id(self, folder_info: dict[str, Any]) -> str:
         return str(folder_info.get("folder_id") or folder_info.get("id") or "")
 
-    async def _list_group_files(
+    def _extract_busid(self, file_info: dict[str, Any]) -> int:
+        return int(file_info.get("busid") or file_info.get("bus_id") or 0)
+
+    def _sanitize_upload_error(self, exc: Exception) -> str:
+        message = str(exc)
+        message = re.sub(r"base64://[A-Za-z0-9+/=_-]+", "base64://<redacted>", message)
+        message = re.sub(
+            r"data:[^,\s]+;base64,[A-Za-z0-9+/=_-]+",
+            "data:<redacted>;base64,<redacted>",
+            message,
+        )
+        return message
+
+    async def _list_group_files_and_folders(
         self, event: AstrMessageEvent, group_id: str
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         root = self._extract_data(
             await self._call_onebot_api(
                 event, "get_group_root_files", group_id=int(group_id)
             )
         )
         files: list[dict[str, Any]] = []
+        all_folders: list[dict[str, Any]] = []
         for file_info in root.get("files") or []:
             copied = dict(file_info)
             copied["_folder_path"] = ""
             files.append(copied)
 
-        folders: list[tuple[dict[str, Any], str]] = [
-            (folder, _folder_name(folder)) for folder in root.get("folders") or []
-        ]
+        folders: list[tuple[dict[str, Any], str]] = []
+        for folder in root.get("folders") or []:
+            folder_path = _folder_name(folder)
+            copied = dict(folder)
+            copied["_folder_path"] = folder_path
+            copied["_parent_folder_id"] = ""
+            all_folders.append(copied)
+            folders.append((copied, folder_path))
         seen_folder_ids: set[str] = set()
 
         while folders:
@@ -473,15 +498,163 @@ class CourseScheduleBase:
             for child_folder in child.get("folders") or []:
                 child_name = _folder_name(child_folder)
                 child_path = _join_folder_path(folder_path, child_name)
-                folders.append((child_folder, child_path))
+                copied = dict(child_folder)
+                copied["_folder_path"] = child_path
+                copied["_parent_folder_id"] = folder_id
+                all_folders.append(copied)
+                folders.append((copied, child_path))
 
+        return files, all_folders
+
+    async def _list_group_files(
+        self, event: AstrMessageEvent, group_id: str
+    ) -> list[dict[str, Any]]:
+        files, _folders = await self._list_group_files_and_folders(event, group_id)
         return files
+
+    async def _ensure_schedule_folder(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        folders: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if folders is None:
+            _files, folders = await self._list_group_files_and_folders(event, group_id)
+
+        for folder_info in folders:
+            folder_path = str(folder_info.get("_folder_path") or "").strip("/").lower()
+            if folder_path == SCHEDULE_FOLDER_NAME:
+                folder_id = self._extract_folder_id(folder_info)
+                if folder_id:
+                    return folder_id
+
+        try:
+            response = self._extract_data(
+                await self._call_onebot_api(
+                    event,
+                    "create_group_file_folder",
+                    group_id=int(group_id),
+                    name=SCHEDULE_FOLDER_NAME,
+                    parent_id="/",
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(f"创建群文件 schedule 文件夹失败：{exc}") from exc
+
+        if isinstance(response, dict):
+            folder_id = str(
+                response.get("folder_id")
+                or response.get("id")
+                or response.get("folder")
+                or ""
+            )
+            if folder_id:
+                return folder_id
+
+        _files, folders = await self._list_group_files_and_folders(event, group_id)
+        for folder_info in folders:
+            folder_path = str(folder_info.get("_folder_path") or "").strip("/").lower()
+            if folder_path == SCHEDULE_FOLDER_NAME:
+                folder_id = self._extract_folder_id(folder_info)
+                if folder_id:
+                    return folder_id
+
+        raise RuntimeError("创建群文件 schedule 文件夹后未找到 folder_id")
+
+    async def _delete_group_file(
+        self, event: AstrMessageEvent, group_id: str, file_info: dict[str, Any]
+    ) -> None:
+        file_id = self._extract_file_id(file_info)
+        if not file_id:
+            raise ValueError("群文件缺少 file_id/id")
+
+        await self._call_onebot_api(
+            event,
+            "delete_group_file",
+            group_id=int(group_id),
+            file_id=file_id,
+            busid=self._extract_busid(file_info),
+        )
+
+    async def _delete_old_schedule_files(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+    ) -> tuple[list[str], list[str]]:
+        try:
+            files = await self._list_group_files(event, group_id)
+        except Exception as exc:
+            logger.error(f"Failed to list group files when deleting old files: {exc}")
+            return [], [f"{user_id}: 读取群文件以删除旧文件失败：{exc}"]
+
+        matched: list[dict[str, Any]] = []
+        for file_info in files:
+            matched_user_id = _extract_schedule_user_id(
+                _file_name(file_info), str(file_info.get("_folder_path") or "")
+            )
+            if matched_user_id == user_id:
+                matched.append(file_info)
+
+        if not matched:
+            return [], []
+
+        normalized_files = [
+            file_info
+            for file_info in matched
+            if _is_normalized_schedule_file(file_info, user_id)
+        ]
+        keep_file: dict[str, Any] | None = None
+        if not normalized_files:
+            logger.warning(
+                f"Uploaded normalized schedule file for {user_id}, "
+                "but it was not found when cleaning old files."
+            )
+            return [], [
+                f"{user_id}: 上传后未找到 {_normalized_schedule_path(user_id)}，"
+                "已跳过删除旧文件"
+            ]
+
+        for file_info in normalized_files:
+            if keep_file is None:
+                keep_file = file_info
+                continue
+
+            file_time = _group_file_updated_at(file_info)
+            keep_time = _group_file_updated_at(keep_file)
+            if _compare_timestamps(file_time, keep_time) == 1 or (
+                file_time and not keep_time
+            ):
+                keep_file = file_info
+
+        keep_time = _group_file_updated_at(keep_file) if keep_file else None
+        deleted: list[str] = []
+        failed: list[str] = []
+        for file_info in matched:
+            if file_info is keep_file:
+                continue
+            if _is_normalized_schedule_file(file_info, user_id):
+                file_time = _group_file_updated_at(file_info)
+                if not file_time or not keep_time:
+                    continue
+
+            display_path = _display_group_file_path(file_info)
+            try:
+                await self._delete_group_file(event, group_id, file_info)
+                deleted.append(display_path)
+            except Exception as exc:
+                logger.error(
+                    f"Failed to delete old group schedule file {display_path}: {exc}"
+                )
+                failed.append(f"{display_path}: {exc}")
+
+        return deleted, failed
 
     async def _get_group_file_url(
         self, event: AstrMessageEvent, group_id: str, file_info: dict[str, Any]
     ) -> str:
         file_id = self._extract_file_id(file_info)
-        busid = int(file_info.get("busid") or file_info.get("bus_id") or 0)
+        busid = self._extract_busid(file_info)
         if not file_id:
             raise ValueError("群文件缺少 file_id/id")
 
@@ -510,43 +683,50 @@ class CourseScheduleBase:
         group_id: str,
         user_id: str,
         ics_content: str,
-        target_file_info: dict[str, Any] | None = None,
+        schedule_folder_id: str | None = None,
     ) -> str:
         default_filename, local_path = await asyncio.to_thread(
             _write_temp_schedule_ics, user_id, ics_content
         )
-        filename = (
-            _file_name(target_file_info)
-            if isinstance(target_file_info, dict) and _file_name(target_file_info)
-            else default_filename
-        )
+        filename = _normalized_schedule_filename(user_id) or default_filename
+        folder_id = str(schedule_folder_id or "")
+        if not folder_id:
+            folder_id = await self._ensure_schedule_folder(event, group_id)
+
         params: dict[str, Any] = {
             "group_id": int(group_id),
             "file": local_path,
             "name": filename,
+            "folder": folder_id,
         }
-        folder_id = (
-            str(target_file_info.get("_folder_id") or "")
-            if isinstance(target_file_info, dict)
-            else ""
-        )
-        if folder_id:
-            params["folder"] = folder_id
 
-        try:
-            await self._call_onebot_api(event, "upload_group_file", **params)
-        except Exception:
-            if "folder" not in params:
-                raise
-            params.pop("folder", None)
-            await self._call_onebot_api(event, "upload_group_file", **params)
+        upload_attempts: list[dict[str, Any]] = []
+        upload_files = [
+            local_path,
+            _local_file_uri(local_path),
+            *_inline_file_uris(ics_content),
+        ]
+        for upload_file in upload_files:
+            attempt = dict(params)
+            attempt["file"] = upload_file
+            upload_attempts.append(attempt)
 
-        folder_path = (
-            str(target_file_info.get("_folder_path") or "").strip("/")
-            if isinstance(target_file_info, dict)
-            else ""
-        )
-        return f"{folder_path}/{filename}" if folder_path else filename
+        last_exc: Exception | None = None
+        for attempt in upload_attempts:
+            try:
+                await self._call_onebot_api(event, "upload_group_file", **attempt)
+                break
+            except Exception as exc:
+                last_exc = exc
+        else:
+            if last_exc:
+                raise RuntimeError(
+                    "upload_group_file failed after trying local path, file URI, "
+                    "base64 URI and data URI: "
+                    f"{self._sanitize_upload_error(last_exc)}"
+                ) from last_exc
+
+        return _normalized_schedule_path(user_id)
 
     async def _download_group_schedule(
         self,
@@ -555,7 +735,7 @@ class CourseScheduleBase:
         user_id: str,
         file_info: dict[str, Any],
         remote_updated_at: datetime | None,
-    ) -> None:
+    ) -> str:
         url = await self._get_group_file_url(event, group_id, file_info)
         ics_content = await asyncio.to_thread(_download_text, url)
         member_name = await self._get_group_member_name(event, group_id, user_id)
@@ -568,6 +748,7 @@ class CourseScheduleBase:
             name=member_name,
             remote_updated_at=remote_updated_at,
         )
+        return ics_content
 
     async def _sync_group_files_text(self, event: AstrMessageEvent) -> str:
         group_id = event.get_group_id()
@@ -575,7 +756,7 @@ class CourseScheduleBase:
             return "只能在群聊中同步群文件。"
 
         try:
-            files = await self._list_group_files(event, group_id)
+            files, folders = await self._list_group_files_and_folders(event, group_id)
         except Exception as exc:
             logger.error(f"Failed to list group files: {exc}")
             return f"读取群文件失败：{exc}"
@@ -603,16 +784,23 @@ class CourseScheduleBase:
 
             current_time = _group_file_updated_at(current)
             next_time = _group_file_updated_at(file_info)
-            if _compare_timestamps(next_time, current_time) == 1 or (
-                next_time and not current_time
+            comparison = _compare_timestamps(next_time, current_time)
+            if comparison == 1 or (next_time and not current_time):
+                remote_by_user[user_id] = file_info
+            elif (
+                comparison == 0
+                and _is_normalized_schedule_file(file_info, user_id)
+                and not _is_normalized_schedule_file(current, user_id)
             ):
                 remote_by_user[user_id] = file_info
 
         downloaded: list[str] = []
         uploaded: list[str] = []
         skipped: list[str] = []
+        deleted_old: list[str] = []
         failed: list[str] = []
         processed_users: set[str] = set()
+        schedule_folder_id: str | None = None
 
         for user_id, file_info in remote_by_user.items():
             display_path = _display_group_file_path(file_info)
@@ -632,23 +820,97 @@ class CourseScheduleBase:
                     and isinstance(local_info, dict)
                     and local_info.get("ics")
                 ):
+                    if schedule_folder_id is None:
+                        schedule_folder_id = await self._ensure_schedule_folder(
+                            event, group_id, folders
+                        )
                     uploaded_name = await self._upload_schedule_file(
-                        event, group_id, user_id, str(local_info["ics"]), file_info
+                        event,
+                        group_id,
+                        user_id,
+                        str(local_info["ics"]),
+                        schedule_folder_id=schedule_folder_id,
                     )
                     await self._mark_schedule_synced(
                         event, user_id, uploaded_name, datetime.now(timezone.utc)
                     )
                     uploaded.append(f"{user_id} -> {uploaded_name}")
-                elif comparison == 0 and isinstance(local_info, dict):
-                    await self._mark_schedule_synced(
-                        event, user_id, display_path, remote_updated_at
+                    deleted, delete_failed = await self._delete_old_schedule_files(
+                        event, group_id, user_id
                     )
-                    skipped.append(f"{display_path} 已是最新")
+                    deleted_old.extend(deleted)
+                    failed.extend(delete_failed)
+                elif comparison == 0 and isinstance(local_info, dict):
+                    if _is_normalized_schedule_file(file_info, user_id):
+                        await self._mark_schedule_synced(
+                            event, user_id, display_path, remote_updated_at
+                        )
+                        skipped.append(f"{display_path} 已是最新")
+                        deleted, delete_failed = await self._delete_old_schedule_files(
+                            event, group_id, user_id
+                        )
+                        deleted_old.extend(deleted)
+                        failed.extend(delete_failed)
+                    else:
+                        ics_content = str(local_info.get("ics") or "")
+                        if not ics_content:
+                            ics_content = await self._download_group_schedule(
+                                event, group_id, user_id, file_info, remote_updated_at
+                            )
+                            downloaded.append(f"{display_path} -> {user_id}")
+
+                        if schedule_folder_id is None:
+                            schedule_folder_id = await self._ensure_schedule_folder(
+                                event, group_id, folders
+                            )
+                        uploaded_name = await self._upload_schedule_file(
+                            event,
+                            group_id,
+                            user_id,
+                            ics_content,
+                            schedule_folder_id=schedule_folder_id,
+                        )
+                        await self._mark_schedule_synced(
+                            event, user_id, uploaded_name, datetime.now(timezone.utc)
+                        )
+                        uploaded.append(f"{user_id} -> {uploaded_name}")
+                        deleted, delete_failed = await self._delete_old_schedule_files(
+                            event, group_id, user_id
+                        )
+                        deleted_old.extend(deleted)
+                        failed.extend(delete_failed)
                 else:
-                    await self._download_group_schedule(
+                    ics_content = await self._download_group_schedule(
                         event, group_id, user_id, file_info, remote_updated_at
                     )
                     downloaded.append(f"{display_path} -> {user_id}")
+                    if not _is_normalized_schedule_file(file_info, user_id):
+                        if schedule_folder_id is None:
+                            schedule_folder_id = await self._ensure_schedule_folder(
+                                event, group_id, folders
+                            )
+                        uploaded_name = await self._upload_schedule_file(
+                            event,
+                            group_id,
+                            user_id,
+                            ics_content,
+                            schedule_folder_id=schedule_folder_id,
+                        )
+                        await self._mark_schedule_synced(
+                            event, user_id, uploaded_name, datetime.now(timezone.utc)
+                        )
+                        uploaded.append(f"{user_id} -> {uploaded_name}")
+                        deleted, delete_failed = await self._delete_old_schedule_files(
+                            event, group_id, user_id
+                        )
+                        deleted_old.extend(deleted)
+                        failed.extend(delete_failed)
+                    else:
+                        deleted, delete_failed = await self._delete_old_schedule_files(
+                            event, group_id, user_id
+                        )
+                        deleted_old.extend(deleted)
+                        failed.extend(delete_failed)
             except Exception as exc:
                 logger.error(f"Failed to sync group file {display_path}: {exc}")
                 failed.append(f"{display_path}: {exc}")
@@ -661,13 +923,26 @@ class CourseScheduleBase:
                 continue
 
             try:
+                if schedule_folder_id is None:
+                    schedule_folder_id = await self._ensure_schedule_folder(
+                        event, group_id, folders
+                    )
                 uploaded_name = await self._upload_schedule_file(
-                    event, group_id, user_id, str(ics_content)
+                    event,
+                    group_id,
+                    user_id,
+                    str(ics_content),
+                    schedule_folder_id=schedule_folder_id,
                 )
                 await self._mark_schedule_synced(
                     event, user_id, uploaded_name, datetime.now(timezone.utc)
                 )
                 uploaded.append(f"{user_id} -> {uploaded_name}")
+                deleted, delete_failed = await self._delete_old_schedule_files(
+                    event, group_id, user_id
+                )
+                deleted_old.extend(deleted)
+                failed.extend(delete_failed)
             except Exception as exc:
                 logger.error(f"Failed to upload local schedule for {user_id}: {exc}")
                 failed.append(f"{user_id}: {exc}")
@@ -675,7 +950,8 @@ class CourseScheduleBase:
         lines = [
             "群文件双向同步完成："
             f"下载 {len(downloaded)} 个，上传 {len(uploaded)} 个，"
-            f"跳过 {len(skipped)} 个，失败 {len(failed)} 个。"
+            f"删除旧文件 {len(deleted_old)} 个，跳过 {len(skipped)} 个，"
+            f"失败 {len(failed)} 个。"
         ]
         if downloaded:
             lines.append("已下载：")
@@ -683,6 +959,9 @@ class CourseScheduleBase:
         if uploaded:
             lines.append("已上传：")
             lines.extend(uploaded[:20])
+        if deleted_old:
+            lines.append("已删除旧文件：")
+            lines.extend(deleted_old[:20])
         if skipped:
             lines.append("已跳过：")
             lines.extend(skipped[:10])
@@ -699,28 +978,42 @@ class CourseScheduleBase:
 
         target_id, info, error = await self._resolve_member_info(event)
         if error:
-            return "你还没有保存课程表。请先上传 schedule<QQ号>.ics 并同步。"
+            return "你还没有保存课程表。请先上传 schedule/<QQ号>.ics 并同步。"
 
         ics_content = info.get("ics")
         if not ics_content:
             return "当前课程表不是从 .ics 导入的，无法导出原始 .ics。"
 
-        filename = f"schedule{target_id or event.get_sender_id()}.ics"
+        user_id = target_id or event.get_sender_id()
+        filename = _normalized_schedule_path(user_id)
         try:
+            schedule_folder_id = await self._ensure_schedule_folder(event, group_id)
             filename = await self._upload_schedule_file(
-                event, group_id, target_id or event.get_sender_id(), str(ics_content)
+                event,
+                group_id,
+                user_id,
+                str(ics_content),
+                schedule_folder_id=schedule_folder_id,
             )
             await self._mark_schedule_synced(
                 event,
-                target_id or event.get_sender_id(),
+                user_id,
                 filename,
                 datetime.now(timezone.utc),
+            )
+            deleted, delete_failed = await self._delete_old_schedule_files(
+                event, group_id, user_id
             )
         except Exception as exc:
             logger.error(f"Failed to upload group file {filename}: {exc}")
             return f"上传群文件失败：{exc}"
 
-        return f"已上传 {filename} 到当前群文件。"
+        message = f"已上传 {filename} 到当前群文件。"
+        if deleted:
+            message += f"\n已删除旧文件 {len(deleted)} 个。"
+        if delete_failed:
+            message += "\n旧文件删除失败：\n" + "\n".join(delete_failed[:5])
+        return message
 
     async def _member_day_schedule_text(
         self, event: AstrMessageEvent, query: str, day: str

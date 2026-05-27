@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,22 @@ def _display_group_file_path(file_info: dict[str, Any]) -> str:
     return f"{folder_path}/{filename}"
 
 
+def _normalized_schedule_filename(user_id: str) -> str:
+    return f"{user_id}.ics"
+
+
+def _normalized_schedule_path(user_id: str) -> str:
+    return f"{SCHEDULE_FOLDER_NAME}/{_normalized_schedule_filename(user_id)}"
+
+
+def _is_normalized_schedule_file(file_info: dict[str, Any], user_id: str) -> bool:
+    folder_path = str(file_info.get("_folder_path") or "").strip("/").lower()
+    return (
+        folder_path == SCHEDULE_FOLDER_NAME
+        and _file_name(file_info).lower() == _normalized_schedule_filename(user_id).lower()
+    )
+
+
 def _download_text(url: str, max_bytes: int = MAX_ICS_BYTES) -> str:
     with urlopen(url, timeout=20) as response:
         data = response.read(max_bytes + 1)
@@ -73,8 +90,20 @@ def _write_temp_ics(filename: str, content: str) -> str:
 
 
 def _write_temp_schedule_ics(user_id: str, content: str) -> tuple[str, str]:
-    filename = f"schedule{user_id}.ics"
+    filename = _normalized_schedule_filename(user_id)
     return filename, _write_temp_ics(filename, content)
+
+
+def _local_file_uri(path: str) -> str:
+    return Path(path).resolve().as_uri()
+
+
+def _inline_file_uris(content: str) -> list[str]:
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    return [
+        f"base64://{encoded}",
+        f"data:text/calendar;charset=utf-8;base64,{encoded}",
+    ]
 
 
 def _asset_temp_path(filename: str) -> str:

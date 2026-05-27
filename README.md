@@ -4,12 +4,12 @@ AstrBot 课程表插件，用于从 QQ 群文件中的 `.ics` 课程表同步数
 
 ## 功能
 
-- 从群文件读取根目录 `schedule<QQ号>.ics`。
-- 从群文件 `schedule/` 文件夹读取 `<QQ号>.ics`。
+- 从群文件读取根目录旧格式 `schedule<QQ号>.ics`。
+- 从群文件 `schedule/` 文件夹读取规范格式 `<QQ号>.ics`。
 - 解析 iCalendar `.ics` 文件中的 `VEVENT` 课程事件。
 - 按群号和 QQ 号保存每个人的课程表。
 - 生成当前会话今日课程表图片。
-- 通过指令按时间戳双向同步群文件课程表，本地较新时会上传到对应群文件。
+- 通过指令按时间戳双向同步群文件课程表，上传时统一写入 `schedule/<QQ号>.ics`，成功后清理旧格式文件。
 - 向 AI 暴露只读 SQL 查询工具，可查询不同人、不同时间范围的课程和统计结果。
 - 向 AI 暴露 SQL 修改工具，可修改本地课程事件并自动重建本地 `.ics`。
 - 图片渲染内置 Noto Sans CJK SC 中文字体。
@@ -18,18 +18,20 @@ AstrBot 课程表插件，用于从 QQ 群文件中的 `.ics` 课程表同步数
 
 ## 群文件同步
 
-把课程表文件上传到 QQ 群文件，支持两种放法。
+把课程表文件上传到 QQ 群文件，推荐使用规范路径。
 
-放在群文件根目录：
-
-```text
-schedule<QQ号>.ics
-```
-
-放在群文件 `schedule` 文件夹：
+规范路径：
 
 ```text
 schedule/<QQ号>.ics
+```
+
+为了兼容旧文件，插件同步时仍会读取旧格式：
+
+群文件根目录：
+
+```text
+schedule<QQ号>.ics
 ```
 
 例如：
@@ -48,8 +50,10 @@ schedule/123456789.ics
 插件会通过 OneBot 扩展 API 读取群文件列表和文件夹，下载符合命名规则的 `.ics` 文件。同步按时间戳比较：
 
 - 远端较新：下载群文件并覆盖本地缓存。
-- 本地较新：上传本地 `.ics` 到对应群文件。
-- 时间相同：只更新时间戳记录并跳过。
+- 本地较新：上传本地 `.ics` 到 `schedule/<QQ号>.ics`。
+- 时间相同：规范路径已存在时只更新时间戳记录并跳过；仍是旧路径时会上传规范路径。
+
+上传规范路径成功后，插件会重新扫描群文件，并删除同一 QQ 号对应的旧格式文件或重复文件。旧文件删除失败只会计入同步结果，不会回滚已经成功的上传。
 
 AI 通过 SQL 修改本地课程后会刷新本地 `schedule_updated_at` 并重建本地 `.ics`，此时再执行 `/同步课表` 会把本地较新的版本上传到群文件。
 
@@ -163,6 +167,8 @@ DELETE FROM local_courses WHERE id=3
 - `get_group_files_by_folder`
 - `get_group_file_url`
 - `upload_group_file`
+- `create_group_file_folder`
+- `delete_group_file`
 
 这些 API 不是 OneBot 11 基础公开 API 的一部分，通常由 go-cqhttp、NapCat、Lagrange 等 OneBot v11 实现提供。
 
