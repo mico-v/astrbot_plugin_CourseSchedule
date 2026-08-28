@@ -66,6 +66,7 @@ def _event_to_row(index: int, event: dict[str, str]) -> tuple[Any, ...]:
         event.get("DTEND_TZID") or "",
         event.get("RRULE") or "",
         event.get("DTSTAMP") or "",
+        event.get("RAW_ICAL") or "",
     )
 
 
@@ -82,6 +83,7 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, str]:
         "dtend_tzid": "DTEND_TZID",
         "rrule": "RRULE",
         "dtstamp": "DTSTAMP",
+        "raw_ical": "RAW_ICAL",
     }
     for column, key in field_map.items():
         value = str(row[column] or "").strip()
@@ -106,15 +108,16 @@ def _create_edit_db(events: list[dict[str, str]]) -> sqlite3.Connection:
             dtstart_tzid TEXT,
             dtend_tzid TEXT,
             rrule TEXT,
-            dtstamp TEXT
+            dtstamp TEXT,
+            raw_ical TEXT
         )
         """
     )
     conn.executemany(
         """
         INSERT INTO local_courses
-        (id, uid, course, location, description, dtstart, dtend, dtstart_tzid, dtend_tzid, rrule, dtstamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, uid, course, location, description, dtstart, dtend, dtstart_tzid, dtend_tzid, rrule, dtstamp, raw_ical)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [_event_to_row(index, event) for index, event in enumerate(events, start=1)],
     )
@@ -178,7 +181,9 @@ def apply_local_course_sql_edit(
     for event in edited_events:
         event["DTSTAMP"] = event.get("DTSTAMP") or dtstamp
 
-    ics_content = _serialize_schedule_ics(edited_events)
+    ics_content = _serialize_schedule_ics(
+        edited_events, str(member_info.get("ics") or "")
+    )
     return edited_events, ics_content, changes
 
 

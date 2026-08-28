@@ -7,7 +7,7 @@ from .plugin.constants import PLUGIN_ID
 from .plugin.course_schedule import CourseScheduleBase
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.6.0")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.0")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -20,11 +20,6 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
             yield event.plain_result("当前会话还没有可展示的今日课程表。")
             return
         yield event.image_result(path)
-
-    @filter.command("同步课表")
-    async def sync_schedule_files(self, event: AstrMessageEvent):
-        """按时间戳同步当前群的 .ics 课程表文件"""
-        yield event.plain_result(await self._sync_group_files_text(event))
 
     @filter.llm_tool(name="query_course_schedule_sql")
     async def query_course_schedule_sql_tool(
@@ -46,7 +41,7 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
     async def edit_local_course_schedule_sql_tool(
         self, event: AstrMessageEvent, sql: str, query: str = ""
     ):
-        """用 SQL 修改本地保存的结构化课程表，并自动更新本地 .ics 内容和本地时间戳。不会同步或上传群文件。
+        """用 SQL 修改本地保存的结构化课程表，并自动更新本地 .ics 内容和本地时间戳。不会执行网络操作。
 
         可修改表：
         local_courses(id, course, location, description, dtstart, dtend, dtstart_tzid, dtend_tzid, rrule)
