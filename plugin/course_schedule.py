@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+import re
+from datetime import date, datetime, time
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
 
 from .constants import LOCAL_TZ, MAX_ICS_BYTES
-from .ics import _format_ics_schedule, _parse_schedule_ics
+from .domain import common_free_slots, day_occurrences, make_event, select_member_ids
+from .ics import _format_ics_schedule, _parse_schedule_ics, _serialize_schedule_ics
 from .occurrences import _day_bounds, _expand_member_occurrences
 from .render import _draw_rows_image
 from .sql_edit import apply_sql_edit_to_member
@@ -152,6 +154,174 @@ class CourseScheduleBase:
             f"已用 SQL 修改 {name}({target_id}) 的本地课程表，影响 {changes} 条，"
             f"当前共有 {updated_info.get('event_count', 0)} 个事件。"
         )
+
+    async def _save_domain_events(
+        self,
+        event: AstrMessageEvent,
+        target_id: str,
+        info: dict[str, Any],
+        events: list[dict[str, str]],
+    ) -> None:
+        now = _now_iso()
+        updated = dict(info)
+        updated["name"] = updated.get("name") or event.get_sender_name() or target_id
+        updated["events"] = events
+        updated["event_count"] = len(events)
+        updated["ics"] = _serialize_schedule_ics(events, str(info.get("ics") or ""))
+        updated["schedule"] = _format_ics_schedule(events)
+        updated["source"] = "ics"
+        updated["updated_at"] = now
+        updated["schedule_updated_at"] = now
+        updated["last_modified_by"] = event.get_sender_id()
+        await self._schedule_store.put_member(
+            _scope_id(event),
+            target_id,
+            updated,
+            expected_revision=int(info.get("_revision") or 0),
+        )
+
+    async def _create_course_text(
+        self,
+        event: AstrMessageEvent,
+        course: str,
+        start_time: str,
+        end_time: str,
+        location: str = "",
+        description: str = "",
+        rrule: str = "",
+    ) -> str:
+        target_id = str(event.get_sender_id())
+        info = await self._schedule_store.get_member(_scope_id(event), target_id) or {}
+        events = [dict(item) for item in info.get("events", []) if isinstance(item, dict)]
+        try:
+            events.append(
+                make_event(
+                    course, start_time, end_time,
+                    location=location, description=description, rrule=rrule,
+                )
+            )
+            events.sort(key=lambda item: item.get("DTSTART", ""))
+            await self._save_domain_events(event, target_id, info, events)
+        except (ValueError, ScheduleWriteConflict) as exc:
+            return str(exc)
+        return f"已创建课程“{course}”，当前共有 {len(events)} 个课程事件。"
+
+    async def _update_course_text(
+        self, event: AstrMessageEvent, course_id: int, query: str = "", **changes: str
+    ) -> str:
+        target_id, info, error = await self._resolve_member_info(event, query)
+        if error or not target_id or not info:
+            return error or "未找到课程表。"
+        events = [dict(item) for item in info.get("events", []) if isinstance(item, dict)]
+        index = int(course_id) - 1
+        if index < 0 or index >= len(events):
+            return f"course_id 超出范围，当前有效范围为 1..{len(events)}。"
+        old = events[index]
+        try:
+            events[index] = make_event(
+                changes.get("course") or old.get("SUMMARY", ""),
+                changes.get("start_time") or old.get("DTSTART", ""),
+                changes.get("end_time") or old.get("DTEND", ""),
+                location=changes.get("location") if changes.get("location") != "" else old.get("LOCATION", ""),
+                description=changes.get("description") if changes.get("description") != "" else old.get("DESCRIPTION", ""),
+                rrule=changes.get("rrule") if changes.get("rrule") != "" else old.get("RRULE", ""),
+                uid=old.get("UID", ""),
+            )
+            events[index]["RAW_ICAL"] = old.get("RAW_ICAL", "")
+            events.sort(key=lambda item: item.get("DTSTART", ""))
+            await self._save_domain_events(event, target_id, info, events)
+        except (ValueError, ScheduleWriteConflict) as exc:
+            return str(exc)
+        return f"已更新 {info.get('name') or target_id} 的 course_id={course_id}。"
+
+    async def _delete_course_text(
+        self, event: AstrMessageEvent, course_id: int, query: str = ""
+    ) -> str:
+        target_id, info, error = await self._resolve_member_info(event, query)
+        if error or not target_id or not info:
+            return error or "未找到课程表。"
+        events = [dict(item) for item in info.get("events", []) if isinstance(item, dict)]
+        index = int(course_id) - 1
+        if index < 0 or index >= len(events):
+            return f"course_id 超出范围，当前有效范围为 1..{len(events)}。"
+        removed = events.pop(index)
+        try:
+            await self._save_domain_events(event, target_id, info, events)
+        except ScheduleWriteConflict as exc:
+            return str(exc)
+        return f"已删除课程“{removed.get('SUMMARY') or course_id}”，剩余 {len(events)} 个事件。"
+
+    async def _daily_schedule_text(
+        self, event: AstrMessageEvent, target_date: str = "", members_query: str = ""
+    ) -> str:
+        members = await self._get_scope_members(event)
+        if not members:
+            return "当前会话还没有保存任何课程表。"
+        try:
+            target = date.fromisoformat(target_date) if target_date else datetime.now(LOCAL_TZ).date()
+        except ValueError:
+            return "target_date 应使用 YYYY-MM-DD 格式。"
+        ids = select_member_ids(members, members_query)
+        if members_query and not ids:
+            return "没有找到指定成员。"
+        rows = day_occurrences(members, target, ids)
+        if not rows:
+            return f"{target:%Y-%m-%d} 没有课程。"
+        lines = [f"{target:%Y-%m-%d} 课程（{len(rows)} 条）："]
+        for user_id, info, occurrence in rows:
+            lines.append(
+                f"{occurrence['_start']:%H:%M}-{occurrence['_end']:%H:%M} "
+                f"{info.get('name') or user_id}：{occurrence.get('SUMMARY') or '未命名课程'}"
+                + (f" @{occurrence['LOCATION']}" if occurrence.get("LOCATION") else "")
+            )
+        return "\n".join(lines)
+
+    async def _common_free_time_text(
+        self, event: AstrMessageEvent, target_date: str, members_query: str = "",
+        day_start: str = "08:00", day_end: str = "22:00", minimum_minutes: int = 30,
+    ) -> str:
+        members = await self._get_scope_members(event)
+        try:
+            target = date.fromisoformat(target_date)
+            start_clock = time.fromisoformat(day_start)
+            end_clock = time.fromisoformat(day_end)
+        except ValueError:
+            return "日期或时间格式错误，日期用 YYYY-MM-DD，时间用 HH:MM。"
+        if end_clock <= start_clock:
+            return "day_end 必须晚于 day_start。"
+        ids = select_member_ids(members, members_query)
+        if not ids:
+            return "没有找到参与计算的成员。"
+        slots = common_free_slots(members, target, ids, start_clock, end_clock, max(1, int(minimum_minutes)))
+        labels = [str(members[user_id].get("name") or user_id) for user_id in ids]
+        if not slots:
+            return f"{target:%Y-%m-%d} 指定成员没有满足时长的共同空闲时间。"
+        lines = [f"共同空闲时间（{', '.join(labels)}）："]
+        lines.extend(f"{start:%H:%M}-{end:%H:%M}（{int((end-start).total_seconds()/60)} 分钟）" for start, end in slots)
+        return "\n".join(lines)
+
+    async def _shared_classes_text(
+        self, event: AstrMessageEvent, target_date: str, members_query: str = ""
+    ) -> str:
+        members = await self._get_scope_members(event)
+        try:
+            target = date.fromisoformat(target_date)
+        except ValueError:
+            return "target_date 应使用 YYYY-MM-DD 格式。"
+        ids = select_member_ids(members, members_query)
+        grouped: dict[tuple[str, datetime, datetime], list[tuple[str, str]]] = {}
+        for user_id, info, occurrence in day_occurrences(members, target, ids):
+            course_key = re.sub(r"\s+", "", str(occurrence.get("SUMMARY") or "")).casefold()
+            key = (course_key, occurrence["_start"], occurrence["_end"])
+            grouped.setdefault(key, []).append((user_id, str(info.get("name") or user_id)))
+        shared = [(key, people) for key, people in grouped.items() if len({user_id for user_id, _ in people}) >= 2]
+        if not shared:
+            return f"{target:%Y-%m-%d} 没有找到至少两人同一时间、同名的课程。"
+        lines = [f"{target:%Y-%m-%d} 同一节课："]
+        for (course, start, end), people in sorted(shared, key=lambda item: item[0][1]):
+            names = sorted({name for _, name in people})
+            lines.append(f"{start:%H:%M}-{end:%H:%M} {course}：{', '.join(names)}")
+        return "\n".join(lines)
 
     async def _query_schedule_sql_text(
         self, event: AstrMessageEvent, sql: str, time_range: str = "today"

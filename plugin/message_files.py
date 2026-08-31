@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +41,7 @@ async def _read_file_component(component: Any) -> tuple[str, str] | None:
         path_obj = Path(str(path))
         if not path_obj.is_file() or path_obj.stat().st_size > MAX_ICS_BYTES:
             return None
-        content = await asyncio.to_thread(path_obj.read_bytes)
+        content = path_obj.read_bytes()
     except Exception:
         return None
     payload = _decode_payload(content)

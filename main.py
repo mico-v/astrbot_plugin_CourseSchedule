@@ -146,5 +146,83 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         """
         return await self._edit_local_schedule_sql_text(event, sql, query)
 
+    @filter.llm_tool(name="create_course")
+    async def create_course_tool(
+        self,
+        event: AstrMessageEvent,
+        course: str,
+        start_time: str,
+        end_time: str,
+        location: str = "",
+        description: str = "",
+        rrule: str = "",
+    ):
+        """创建发起人的课程事件并保存到 SQLite，同时重建 ICS。"""
+        return await self._create_course_text(
+            event, course, start_time, end_time, location, description, rrule
+        )
+
+    @filter.llm_tool(name="update_course")
+    async def update_course_tool(
+        self,
+        event: AstrMessageEvent,
+        course_id: int,
+        query: str = "",
+        course: str = "",
+        start_time: str = "",
+        end_time: str = "",
+        location: str = "",
+        description: str = "",
+        rrule: str = "",
+    ):
+        """按成员课程表中的 course_id 更新课程；留空字段保持原值。"""
+        return await self._update_course_text(
+            event,
+            course_id,
+            query,
+            course=course,
+            start_time=start_time,
+            end_time=end_time,
+            location=location,
+            description=description,
+            rrule=rrule,
+        )
+
+    @filter.llm_tool(name="delete_course")
+    async def delete_course_tool(
+        self, event: AstrMessageEvent, course_id: int, query: str = ""
+    ):
+        """按成员课程表中的 course_id 删除课程。"""
+        return await self._delete_course_text(event, course_id, query)
+
+    @filter.llm_tool(name="query_daily_course_schedule")
+    async def query_daily_course_schedule_tool(
+        self, event: AstrMessageEvent, target_date: str = "", members_query: str = ""
+    ):
+        """查询指定日期全部成员的课程，返回按开始时间排序的文本。"""
+        return await self._daily_schedule_text(event, target_date, members_query)
+
+    @filter.llm_tool(name="find_common_free_slots")
+    async def find_common_free_slots_tool(
+        self,
+        event: AstrMessageEvent,
+        target_date: str,
+        members_query: str = "",
+        day_start: str = "08:00",
+        day_end: str = "22:00",
+        minimum_minutes: int = 30,
+    ):
+        """查找成员在指定日期的共同空闲时间段。"""
+        return await self._common_free_time_text(
+            event, target_date, members_query, day_start, day_end, minimum_minutes
+        )
+
+    @filter.llm_tool(name="find_shared_classes")
+    async def find_shared_classes_tool(
+        self, event: AstrMessageEvent, target_date: str, members_query: str = ""
+    ):
+        """查找指定日期至少两人同时间、同课程名的课程。"""
+        return await self._shared_classes_text(event, target_date, members_query)
+
 
 __all__ = ["CourseSchedulePlugin"]

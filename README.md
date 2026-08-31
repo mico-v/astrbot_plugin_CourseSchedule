@@ -46,6 +46,20 @@ query_course_schedule_sql(sql, time_range="today")
 edit_local_course_schedule_sql(sql, query="")
 ```
 
+另外提供面向课程领域的工具，Agent 无需拼接 SQL：
+
+```text
+create_course(course, start_time, end_time, location, description, rrule)
+update_course(course_id, query, ...)
+delete_course(course_id, query)
+query_daily_course_schedule(target_date, members_query)
+find_common_free_slots(target_date, members_query, day_start, day_end, minimum_minutes)
+find_shared_classes(target_date, members_query)
+```
+
+其中 `course_id` 是该成员课表当前事件序号；修改工具会执行时间校验、乐观锁写入、
+SQLite 更新和 ICS 重建。`find_common_free_slots` 会展开 RRULE/RDATE/EXDATE 后计算所有指定成员的时间交集。
+
 工具均返回字符串给模型，不会直接向聊天窗口发送文本结果。
 
 ### SQL 查询工具
