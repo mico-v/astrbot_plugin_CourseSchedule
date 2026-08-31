@@ -1,6 +1,6 @@
 # astrbot_plugin_course_schedule
 
-AstrBot 课程表插件，用于保存、查询和展示群友课程表。课程表以标准 iCalendar（`.ics`）作为导入/导出格式，本地使用 SQLite 持久化；后续将通过群文件引用并 @机器人触发导入。
+AstrBot 课程表插件，用于保存、查询和展示群友课程表。课程表以标准 iCalendar（`.ics`）作为导入/导出格式，本地使用 SQLite 持久化；支持文件消息自动导入及群文件引用后 @机器人触发导入。
 
 ## 功能
 
@@ -22,15 +22,22 @@ data/plugin_data/astrbot_plugin_course_schedule/course_schedule.sqlite3
 
 ## ICS 导入
 
-当前版本保留 `_save_ics_schedule` 作为 ICS 导入边界。后续群文件引用 + @机器人消息处理器应下载引用文件内容后调用该方法；导入逻辑本身不依赖 OneBot 群文件 API。
+发送 `/导入课表` 并附加 `.ics` 文件即可导入。插件按 AstrBot 标准
+`event.get_messages()` 消息链读取 `File` 消息段，并调用 `await File.get_file()` 获取本地文件；
+独立的 `.ics` 文件消息也会交给自动导入处理器。
+导入成功后会在当前会话作用域内按发送者 QQ 号写入 SQLite，并保留原始 ICS 内容。
+插件不会调用 OneBot 群文件上传、下载或删除 API。
 
 ## 聊天命令
 
 ```text
 /今日课表
+/课表 [YYYY-MM-DD]
+/导入课表 + .ics 附件
 ```
 
 `/今日课表` 生成当前会话今日课程表图片。
+`/课表 2026-09-01` 生成指定日期的课程表图片；不带日期时等同于今日。
 
 ## AI 工具调用
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
@@ -173,13 +173,16 @@ class CourseScheduleBase:
             datetime.now(LOCAL_TZ),
         )
 
-    async def _group_today_image(self, event: AstrMessageEvent) -> str | None:
+    async def _group_schedule_image(
+        self, event: AstrMessageEvent, target_date: date | None = None
+    ) -> str | None:
         members = await self._get_scope_members(event)
         if not members:
             return None
 
         now = datetime.now(LOCAL_TZ)
-        start_bound, end_bound = _day_bounds(now.date())
+        selected_date = target_date or now.date()
+        start_bound, end_bound = _day_bounds(selected_date)
         rows: list[dict[str, str]] = []
         for user_id, info in members.items():
             if not isinstance(info, dict):
@@ -188,10 +191,10 @@ class CourseScheduleBase:
                 course = occurrence.get("SUMMARY") or "未命名课程"
                 if occurrence.get("LOCATION"):
                     course += f" @ {occurrence['LOCATION']}"
-                status = "今天"
-                if occurrence["_start"] <= now < occurrence["_end"]:
+                status = "当天"
+                if selected_date == now.date() and occurrence["_start"] <= now < occurrence["_end"]:
                     status = "正在上"
-                elif occurrence["_end"] <= now:
+                elif selected_date == now.date() and occurrence["_end"] <= now:
                     status = "已结束"
                 rows.append(
                     {
@@ -205,4 +208,9 @@ class CourseScheduleBase:
                 )
 
         rows.sort(key=lambda row: (row["time"], row["name"], row["course"]))
-        return _draw_rows_image(f"今日课程表 {now:%Y-%m-%d}", rows, "group_today.png")
+        return _draw_rows_image(
+            f"课程表 {selected_date:%Y-%m-%d}", rows, f"schedule_{selected_date:%Y%m%d}.png"
+        )
+
+    async def _group_today_image(self, event: AstrMessageEvent) -> str | None:
+        return await self._group_schedule_image(event)
