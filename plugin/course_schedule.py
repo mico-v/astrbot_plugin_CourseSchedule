@@ -8,9 +8,14 @@ from typing import Any
 from astrbot.api.event import AstrMessageEvent
 
 from .constants import LOCAL_TZ, MAX_ICS_BYTES
-from .domain import common_free_slots, day_occurrences, make_event, select_member_ids
+from .domain import (
+    common_free_slots,
+    daily_member_rows,
+    day_occurrences,
+    make_event,
+    select_member_ids,
+)
 from .ics import _format_ics_schedule, _parse_schedule_ics, _serialize_schedule_ics
-from .occurrences import _day_bounds, _expand_member_occurrences
 from .render import _draw_rows_image
 from .sql_edit import apply_sql_edit_to_member
 from .sql_query import execute_course_schedule_sql
@@ -352,34 +357,11 @@ class CourseScheduleBase:
 
         now = datetime.now(LOCAL_TZ)
         selected_date = target_date or now.date()
-        start_bound, end_bound = _day_bounds(selected_date)
-        rows: list[dict[str, str]] = []
-        for user_id, info in members.items():
-            if not isinstance(info, dict):
-                continue
-            for occurrence in _expand_member_occurrences(info, start_bound, end_bound):
-                course = occurrence.get("SUMMARY") or "未命名课程"
-                if occurrence.get("LOCATION"):
-                    course += f" @ {occurrence['LOCATION']}"
-                status = "当天"
-                if selected_date == now.date() and occurrence["_start"] <= now < occurrence["_end"]:
-                    status = "正在上"
-                elif selected_date == now.date() and occurrence["_end"] <= now:
-                    status = "已结束"
-                rows.append(
-                    {
-                        "user_id": user_id,
-                        "name": str(info.get("name") or user_id),
-                        "subtitle": user_id,
-                        "status": status,
-                        "course": course,
-                        "time": f"{occurrence['_start']:%H:%M}-{occurrence['_end']:%H:%M}",
-                    }
-                )
-
-        rows.sort(key=lambda row: (row["time"], row["name"], row["course"]))
+        rows = daily_member_rows(members, selected_date, now=now)
         return _draw_rows_image(
-            f"课程表 {selected_date:%Y-%m-%d}", rows, f"schedule_{selected_date:%Y%m%d}.png"
+            f"课程表 · {selected_date:%Y-%m-%d}",
+            rows,
+            f"schedule_{selected_date:%Y%m%d}.png",
         )
 
     async def _group_today_image(self, event: AstrMessageEvent) -> str | None:

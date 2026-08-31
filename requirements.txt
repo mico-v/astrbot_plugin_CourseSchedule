@@ -1,2 +1,4 @@
 icalendar>=7.3.0,<8
 python-dateutil>=2.9.0,<3
+Pillow>=10.0.0,<13
+fonttools>=4.0.0,<5

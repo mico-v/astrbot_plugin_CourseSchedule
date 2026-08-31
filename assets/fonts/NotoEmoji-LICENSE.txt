@@ -1,0 +1,6 @@
+Noto Emoji font
+
+Copyright 2022 The Noto Project Authors.
+
+This font is distributed under the Apache License, Version 2.0. A copy of
+the license is available at https://www.apache.org/licenses/LICENSE-2.0.
