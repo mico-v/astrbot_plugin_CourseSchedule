@@ -13,7 +13,7 @@ from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.2")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.4")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -71,6 +71,15 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         path = await self._group_today_image(event)
         if not path:
             yield event.plain_result("当前会话还没有可展示的今日课程表。")
+            return
+        yield event.image_result(path)
+
+    @filter.command("明日课表")
+    async def tomorrow_schedule(self, event: AstrMessageEvent):
+        """生成当前会话明日课程表图片"""
+        path = await self._group_tomorrow_image(event)
+        if not path:
+            yield event.plain_result("当前会话还没有可展示的明日课程表。")
             return
         yield event.image_result(path)
 
@@ -209,7 +218,8 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
 
         action 只能是 create/add、update/edit 或 delete/remove，也支持新增、修改、删除等中文。
         person 只能使用 QQ 号或完整昵称精确匹配；留空表示发起人自己。新增时如果目标成员还
-        没有课表会自动创建；修改和删除必须先存在。群聊中修改其他人的课表仅管理员可用，
+        没有课表会自动创建；修改和删除必须先存在。管理员新增尚未登记的成员时，请传目标 QQ 号，或在当前消息
+        @ 目标用户并传入该用户昵称。群聊中修改其他人的课表仅管理员可用，
         管理员身份由消息事件校验，不能通过参数伪造；普通成员只能修改自己的课表。
         修改时 course_id 来自 find 结果，留空的课程字段保持原值。若要清空地点、备注或重复规则，
         将对应字段写入 clear_fields，例如 location,description 或 地点,备注。member_name 可在

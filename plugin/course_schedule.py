@@ -373,6 +373,59 @@ class CourseScheduleBase:
         return _display_name(value).strip()
 
     @classmethod
+    def _agent_mentions(cls, event: AstrMessageEvent) -> list[tuple[str, str]]:
+        """Return non-bot @ mentions as ``(user_id, displayed_name)`` pairs."""
+        try:
+            messages = event.get_messages()
+        except Exception:
+            return []
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            sender_id = ""
+        try:
+            bot_id = str(event.get_self_id() or "").strip()
+        except Exception:
+            bot_id = ""
+
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for component in messages or []:
+            user_id = str(getattr(component, "qq", "") or "").strip()
+            if not user_id or user_id.lower() == "all" or user_id in {bot_id, sender_id}:
+                continue
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            result.append((user_id, cls._agent_text(getattr(component, "name", ""))))
+        return result
+
+    @classmethod
+    def _agent_mention_target(
+        cls, event: AstrMessageEvent, person: str
+    ) -> tuple[str | None, str | None]:
+        """Resolve an unknown person from an explicit @ mention in this message."""
+        mentions = cls._agent_mentions(event)
+        if not mentions:
+            return None, None
+        query = cls._agent_text(person).casefold()
+        named = [user_id for user_id, name in mentions if name and name.casefold() == query]
+        if len(named) == 1:
+            return named[0], None
+        if len(named) > 1:
+            return None, "消息中有多个同名 @ 用户，请直接提供目标 QQ 号。"
+        if len(mentions) == 1:
+            return mentions[0][0], None
+        return None, "找不到该昵称对应的唯一 @ 用户，请直接提供目标 QQ 号。"
+
+    @classmethod
+    def _agent_mention_name(cls, event: AstrMessageEvent, user_id: str) -> str:
+        for mentioned_id, name in cls._agent_mentions(event):
+            if mentioned_id == str(user_id) and name:
+                return name
+        return ""
+
+    @classmethod
     def _agent_time_range(
         cls, value: str, now: datetime
     ) -> tuple[datetime, datetime, str] | None:
@@ -752,6 +805,13 @@ class CourseScheduleBase:
             sender_id,
             allow_unknown_create=operation == "create",
         )
+        if member_error and operation == "create" and person:
+            mentioned_target, mention_error = self._agent_mention_target(event, person)
+            if mentioned_target:
+                target_ids = [mentioned_target]
+                member_error = None
+            elif mention_error:
+                member_error = f"{member_error} {mention_error}"
         if member_error:
             return member_error
         if not target_ids:
@@ -776,6 +836,7 @@ class CourseScheduleBase:
         if not isinstance(info, dict):
             info = {
                 "name": self._agent_text(member_name)
+                or self._agent_mention_name(event, target_id)
                 or self._agent_text(event.get_sender_name())
                 or target_id,
                 "events": [],
@@ -902,3 +963,7 @@ class CourseScheduleBase:
 
     async def _group_today_image(self, event: AstrMessageEvent) -> str | None:
         return await self._group_schedule_image(event)
+
+    async def _group_tomorrow_image(self, event: AstrMessageEvent) -> str | None:
+        tomorrow = datetime.now(LOCAL_TZ).date() + timedelta(days=1)
+        return await self._group_schedule_image(event, tomorrow)

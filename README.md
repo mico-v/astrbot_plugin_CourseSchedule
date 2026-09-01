@@ -36,11 +36,13 @@ data/plugin_data/astrbot_plugin_course_schedule/course_schedule.sqlite3
 
 ```text
 /今日课表
+/明日课表
 /课表 [YYYY-MM-DD]
 /导入课表 + .ics 附件
 ```
 
 `/今日课表` 生成当前会话今日课程表图片。
+`/明日课表` 复用同样的成员卡片图片样式，生成当前会话明日课程表图片。
 `/课表 2026-09-01` 生成指定日期的课程表图片；不带日期时等同于今日。
 
 ## AI 工具调用
@@ -64,6 +66,8 @@ edit(action, person="", course_id=0, course="", start_time="", end_time="", loca
 
 `edit` 的 `action` 支持 `create/add`、`update/edit`、`delete/remove`，也支持新增、修改、删除等中文。
 新增课程必须填写 `course`、`start_time` 和 `end_time`；新增目标没有课表时会自动创建成员记录。
+管理员可以传目标 QQ 号，或在当前消息中 @ 目标用户并传入其昵称来创建尚未登记的成员；仅凭一个
+从未登记且未被 @ 的昵称无法确定对应 QQ 号，插件会要求补充 QQ 号或 @ 目标。
 修改和删除使用 `find` 返回的 `course_id`，留空的修改字段保持原值；通过 `clear_fields` 可以清空
 地点、备注或重复规则。`member_name` 可设置或修改成员昵称。
 
