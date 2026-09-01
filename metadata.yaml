@@ -1,7 +1,7 @@
 name: astrbot_plugin_course_schedule
 display_name: 课程表
 desc: 使用标准 iCalendar 和 SQLite 保存、解析、查询并展示群友课程表。
-version: v0.8.1
+version: v0.8.2
 author: CourseSchedule
 repo: ""
-short_desc: 标准 ICS 解析，文件消息自动导入，AI 用 SQL 查询和修改本地课表。
+short_desc: 标准 ICS 解析，文件消息自动导入，AI 用 find 查询和 edit 增删改本地课表。

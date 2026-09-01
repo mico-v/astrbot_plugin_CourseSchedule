@@ -13,7 +13,7 @@ from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.1")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.2")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -161,117 +161,87 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         )
         yield event.plain_result(result)
 
-    @filter.llm_tool(name="query_course_schedule_sql")
-    async def query_course_schedule_sql_tool(
-        self, event: AstrMessageEvent, sql: str, time_range: str = "today"
-    ):
-        """用类似 SQL 的只读查询检索当前会话课程表，适合复杂查询、多人查询和统计。
-
-        可查询表：
-        members(user_id, name, source, updated_at, schedule_updated_at, source_file, event_count, schedule_text)
-        courses(user_id, name, course, location, description, start_time, end_time, date, weekday, weekday_name, start_clock, end_clock, duration_minutes, status, source_file, rrule)
-
-        Args:
-            sql(string): 只读 SELECT 语句。不要包含分号。可按 user_id、name、date、weekday、course、location、status 等字段过滤、聚合和排序。
-            time_range(string): 展开课程事件的时间范围，支持 today、tomorrow、yesterday、本周、下周、本月、YYYY-MM-DD 或 YYYY-MM-DD..YYYY-MM-DD。默认 today。
-        """
-        return await self._query_schedule_sql_text(event, sql, time_range)
-
-    @filter.llm_tool(name="edit_local_course_schedule_sql")
-    async def edit_local_course_schedule_sql_tool(
-        self, event: AstrMessageEvent, sql: str, query: str = ""
-    ):
-        """用 SQL 修改本地保存的结构化课程表，并自动更新本地 .ics 内容和本地时间戳。不会执行网络操作。
-
-        可修改表：
-        local_courses(id, course, location, description, dtstart, dtend, dtstart_tzid, dtend_tzid, rrule)
-
-        仅支持一条 UPDATE、INSERT 或 DELETE。修改/删除已有课程时必须用 WHERE id=... 精确指定。
-        dtstart/dtend 使用 iCalendar 时间格式，例如 20260526T090000。
-
-        Args:
-            sql(string): 修改 local_courses 的 SQL。不要包含分号。
-            query(string): 成员 QQ 号或昵称关键字。留空表示发起人自己的课程表。
-        """
-        return await self._edit_local_schedule_sql_text(event, sql, query)
-
-    @filter.llm_tool(name="create_course")
-    async def create_course_tool(
+    @filter.llm_tool(name="find")
+    async def find_tool(
         self,
         event: AstrMessageEvent,
-        course: str,
-        start_time: str,
-        end_time: str,
-        location: str = "",
-        description: str = "",
-        rrule: str = "",
+        person: str = "",
+        time_range: str = "",
+        field: str = "",
+        value: str = "",
     ):
-        """创建发起人的课程事件并保存到 SQLite，同时重建 ICS。"""
-        return await self._create_course_text(
-            event, course, start_time, end_time, location, description, rrule
-        )
+        """查找当前会话保存的课程表，支持按人、日期范围和字段组合筛选。
 
-    @filter.llm_tool(name="update_course")
-    async def update_course_tool(
+        不要拼接 SQL。person 只能使用 QQ 号或完整昵称精确匹配；不填表示发送消息的用户。
+        如需查找全部成员，请显式传入 person=all、全部或所有。
+        不填 time_range 表示查找全部已保存的课程事件；也支持 today、tomorrow、yesterday、
+        本周、下周、本月、YYYY-MM-DD 和 YYYY-MM-DD..YYYY-MM-DD。指定日期范围时会展开 RRULE、
+        RDATE 和 EXDATE，返回实际发生的课程。time_range=all、全部也表示全部事件。
+        field/value 用于字段查找，支持 course、location、description、status、date、weekday、
+        start_time、end_time、duration、rrule、member 和 user_id；文本字段支持包含匹配，
+        status/date/weekday/user_id/member 使用精确匹配。返回的 course_id 可直接用于 edit。
+
+        Args:
+            person(string): QQ 号或完整昵称，精确查找某个人；留空表示发送消息的用户；查全部请填 all/全部。
+            time_range(string): 时间范围；留空或填 all/全部查找全部已保存事件。
+            field(string): 要筛选的字段，例如 course、location、status、date、member；留空不筛选。
+            value(string): field 对应的值；使用 field 时必须填写。
+        """
+        return await self._find_schedule_text(event, person, time_range, field, value)
+
+    @filter.llm_tool(name="edit")
+    async def edit_tool(
         self,
         event: AstrMessageEvent,
-        course_id: int,
-        query: str = "",
+        action: str,
+        person: str = "",
+        course_id: int = 0,
         course: str = "",
         start_time: str = "",
         end_time: str = "",
         location: str = "",
         description: str = "",
         rrule: str = "",
+        member_name: str = "",
+        clear_fields: str = "",
     ):
-        """按成员课程表中的 course_id 更新课程；留空字段保持原值。"""
-        return await self._update_course_text(
+        """统一新增、修改、删除课程，并自动维护 SQLite、本地 ICS 和查询数据。
+
+        action 只能是 create/add、update/edit 或 delete/remove，也支持新增、修改、删除等中文。
+        person 只能使用 QQ 号或完整昵称精确匹配；留空表示发起人自己。新增时如果目标成员还
+        没有课表会自动创建；修改和删除必须先存在。群聊中修改其他人的课表仅管理员可用，
+        管理员身份由消息事件校验，不能通过参数伪造；普通成员只能修改自己的课表。
+        修改时 course_id 来自 find 结果，留空的课程字段保持原值。若要清空地点、备注或重复规则，
+        将对应字段写入 clear_fields，例如 location,description 或 地点,备注。member_name 可在
+        新增时设置新成员昵称，也可在修改时更新已有成员昵称。
+
+        Args:
+            action(string): 操作类型：create/add、update/edit、delete/remove，或新增/修改/删除。
+            person(string): 目标 QQ 号或完整昵称；留空表示发起人自己。
+            course_id(number): 修改或删除的课程编号，来自 find 返回的 course_id。
+            course(string): 课程名称；新增必填，修改时留空保持原值。
+            start_time(string): 开始时间，例如 2026-09-01 08:00；新增必填，修改时留空保持原值。
+            end_time(string): 结束时间，例如 2026-09-01 09:30；新增必填，修改时留空保持原值。
+            location(string): 上课地点；修改时留空保持原值，清空请使用 clear_fields。
+            description(string): 课程备注；修改时留空保持原值，清空请使用 clear_fields。
+            rrule(string): iCalendar 重复规则，例如 FREQ=WEEKLY;BYDAY=MO；没有重复则留空。
+            member_name(string): 目标成员显示名称；新增时可用于创建新成员，修改时可重命名。
+            clear_fields(string): 修改时要清空的字段，支持 location、description、rrule 及中文名称。
+        """
+        return await self._edit_schedule_text(
             event,
-            course_id,
-            query,
+            action,
+            person=person,
+            course_id=course_id,
             course=course,
             start_time=start_time,
             end_time=end_time,
             location=location,
             description=description,
             rrule=rrule,
+            member_name=member_name,
+            clear_fields=clear_fields,
         )
-
-    @filter.llm_tool(name="delete_course")
-    async def delete_course_tool(
-        self, event: AstrMessageEvent, course_id: int, query: str = ""
-    ):
-        """按成员课程表中的 course_id 删除课程。"""
-        return await self._delete_course_text(event, course_id, query)
-
-    @filter.llm_tool(name="query_daily_course_schedule")
-    async def query_daily_course_schedule_tool(
-        self, event: AstrMessageEvent, target_date: str = "", members_query: str = ""
-    ):
-        """查询指定日期全部成员的课程，返回按开始时间排序的文本。"""
-        return await self._daily_schedule_text(event, target_date, members_query)
-
-    @filter.llm_tool(name="find_common_free_slots")
-    async def find_common_free_slots_tool(
-        self,
-        event: AstrMessageEvent,
-        target_date: str,
-        members_query: str = "",
-        day_start: str = "08:00",
-        day_end: str = "22:00",
-        minimum_minutes: int = 30,
-    ):
-        """查找成员在指定日期的共同空闲时间段。"""
-        return await self._common_free_time_text(
-            event, target_date, members_query, day_start, day_end, minimum_minutes
-        )
-
-    @filter.llm_tool(name="find_shared_classes")
-    async def find_shared_classes_tool(
-        self, event: AstrMessageEvent, target_date: str, members_query: str = ""
-    ):
-        """查找指定日期至少两人同时间、同课程名的课程。"""
-        return await self._shared_classes_text(event, target_date, members_query)
 
 
 __all__ = ["CourseSchedulePlugin"]

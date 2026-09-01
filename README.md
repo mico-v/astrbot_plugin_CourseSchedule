@@ -9,8 +9,7 @@ AstrBot 课程表插件，用于保存、查询和展示群友课程表。课程
 - 支持 RRULE、RDATE、EXDATE 等重复课程信息。
 - 生成当前会话今日课程表图片。
 - 在 AstrBot WebUI 的插件 Pages 中按群组、成员手动增删改课程，并同步保存到本地 ICS。
-- 向 AI 暴露只读 SQL 查询工具。
-- 向 AI 暴露 SQL 修改工具，修改后自动重建本地 `.ics`。
+- 向 AI 暴露聚合的 `find` 查询工具和 `edit` 编辑工具，避免 Agent 在多个重复工具之间选择。
 - 图片渲染统一使用内置 Noto Sans CJK SC 字体绘制中文、英文、数字和普通符号；仅当该字体确实缺少 Emoji 字形时，才使用单一 Emoji 字体兜底。
 
 今日课表图片按成员分卡片展示：正在上课、下一节即将上课、今日课程已结束和今日无课分别使用不同状态色；当天的当前课程会显示本节时长、距下课/上课倒计时和进度条。昵称中的 Unicode Emoji（包括国旗、肤色和 ZWJ 组合表情）会使用 Emoji 字体单独绘制，避免 CJK 字体缺字。
@@ -46,49 +45,33 @@ data/plugin_data/astrbot_plugin_course_schedule/course_schedule.sqlite3
 
 ## AI 工具调用
 
-```text
-query_course_schedule_sql(sql, time_range="today")
-edit_local_course_schedule_sql(sql, query="")
-```
-
-另外提供面向课程领域的工具，Agent 无需拼接 SQL：
+插件只向 Agent 暴露两个聚合工具：
 
 ```text
-create_course(course, start_time, end_time, location, description, rrule)
-update_course(course_id, query, ...)
-delete_course(course_id, query)
-query_daily_course_schedule(target_date, members_query)
-find_common_free_slots(target_date, members_query, day_start, day_end, minimum_minutes)
-find_shared_classes(target_date, members_query)
+find(person="", time_range="", field="", value="")
+edit(action, person="", course_id=0, course="", start_time="", end_time="", location="", description="", rrule="", member_name="", clear_fields="")
 ```
 
-其中 `course_id` 是该成员课表当前事件序号；修改工具会执行时间校验、乐观锁写入、
-SQLite 更新和 ICS 重建。`find_common_free_slots` 会展开 RRULE/RDATE/EXDATE 后计算所有指定成员的时间交集。
+`find` 不需要拼接 SQL：
+
+- `person` 使用 QQ 号或完整昵称精确查找；留空表示发送消息的用户；查找全部成员时显式传入 `all`、`全部` 或 `所有`。
+- `time_range` 留空、`all` 或 `全部` 查找全部已保存的课程事件；也支持今天、明天、本周、
+  本月、单个日期、`YYYY-MM-DD..YYYY-MM-DD` 日期范围和完整日期时间范围。指定范围时会展开
+  RRULE、RDATE、EXDATE。
+- `field/value` 可按课程名、地点、备注、状态、日期、星期、成员、QQ 号、时长或重复规则筛选。
+  课程名、地点、备注和重复规则支持包含匹配，成员、状态、日期、星期、QQ 号使用精确匹配。
+- 每条结果包含成员、时间、状态、时长和 `course_id`；`course_id` 可以直接交给 `edit`。
+
+`edit` 的 `action` 支持 `create/add`、`update/edit`、`delete/remove`，也支持新增、修改、删除等中文。
+新增课程必须填写 `course`、`start_time` 和 `end_time`；新增目标没有课表时会自动创建成员记录。
+修改和删除使用 `find` 返回的 `course_id`，留空的修改字段保持原值；通过 `clear_fields` 可以清空
+地点、备注或重复规则。`member_name` 可设置或修改成员昵称。
+
+私聊只能编辑自己的课表。群聊中普通成员只能编辑自己的课表；管理员可通过同一个 `edit` 工具指定
+其他成员的 QQ 号或完整昵称进行增删改，管理员身份由 AstrBot 消息事件校验。所有编辑都会执行时间
+校验、revision 乐观锁写入、SQLite 更新和 ICS 重建。
 
 工具均返回字符串给模型，不会直接向聊天窗口发送文本结果。
-
-### SQL 查询工具
-
-查询工具把当前会话的结构化事件展开到内存 SQLite，只允许执行一条 `SELECT` 查询。
-
-可用表：
-
-```text
-members(user_id, name, source, updated_at, schedule_updated_at, source_file, event_count, schedule_text)
-courses(user_id, name, course, location, description, start_time, end_time, date, weekday, weekday_name, start_clock, end_clock, duration_minutes, status, source_file, rrule)
-```
-
-`time_range` 支持 `today`、`tomorrow`、`yesterday`、本周、下周、本月、单个日期和日期范围。
-
-### SQL 修改工具
-
-修改工具只允许操作当前会话本地保存的结构化 ICS 课程：
-
-```text
-local_courses(id, course, location, description, dtstart, dtend, dtstart_tzid, dtend_tzid, rrule)
-```
-
-只支持一条 `UPDATE`、`INSERT` 或 `DELETE`。修改成功后会更新 SQLite 中的事件并重建本地 `.ics`，不会执行网络同步。
 
 ## 开发调试
 
