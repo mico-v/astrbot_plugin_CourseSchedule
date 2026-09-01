@@ -66,21 +66,6 @@ def _load_font(
     return ImageFont.load_default()
 
 
-@lru_cache(maxsize=32)
-def _load_emoji_fonts(size: int) -> tuple[ImageFont.ImageFont, ...]:
-    fonts: list[ImageFont.ImageFont] = []
-    for candidate in _emoji_font_candidates():
-        if not Path(candidate).exists():
-            continue
-        try:
-            font = ImageFont.truetype(candidate, size)
-        except OSError:
-            continue
-        if _has_real_font(font):
-            fonts.append(font)
-    return tuple(fonts)
-
-
 def _has_real_font(font: ImageFont.ImageFont) -> bool:
     return isinstance(font, ImageFont.FreeTypeFont) and isinstance(
         getattr(font, "path", None), (str, Path)
@@ -135,12 +120,15 @@ def _is_emoji_character(character: str) -> bool:
         0x1F000 <= codepoint <= 0x1FAFF
         or 0x1FC00 <= codepoint <= 0x1FFFD
         or 0x2600 <= codepoint <= 0x27BF
-        or 0x2300 <= codepoint <= 0x23FF
         or 0xFE0F == codepoint
         or 0xE000 <= codepoint <= 0xF8FF
         or 0xF0000 <= codepoint <= 0xFFFFD
         or 0x100000 <= codepoint <= 0x10FFFD
     )
+
+
+def _is_emoji_cluster(cluster: str) -> bool:
+    return any(_is_emoji_character(character) for character in cluster)
 
 
 def _graphemes(text: str) -> list[str]:
@@ -182,15 +170,19 @@ def _font_for_cluster(
     cluster: str, size: int, bold: bool
 ) -> tuple[ImageFont.ImageFont, bool]:
     primary = _load_font(size, bold=bold)
-    if not any(_is_emoji_character(character) for character in cluster):
+    if not _is_emoji_cluster(cluster):
         return primary, False
 
-    for emoji_font in _load_emoji_fonts(size):
-        if _font_supports(emoji_font, cluster) and _font_has_visible_glyph(emoji_font, cluster):
-            return emoji_font, True
     if _font_supports(primary, cluster) and _font_has_visible_glyph(primary, cluster):
         return primary, False
-    return _load_font(size, emoji=True), False
+
+    # Keep one consistent primary font for all regular text.  Only a cluster
+    # that the primary font cannot render gets the single configured Emoji
+    # fallback (important for QQ private-use Emoji and ZWJ sequences).
+    emoji_font = _load_font(size, emoji=True)
+    if _font_supports(emoji_font, cluster) and _font_has_visible_glyph(emoji_font, cluster):
+        return emoji_font, True
+    return primary, False
 
 
 def _rich_width(text: str, size: int, bold: bool = False) -> float:
@@ -217,6 +209,35 @@ def _fit_rich_text(text: str, size: int, max_width: int, bold: bool = False) -> 
     return "".join(fitted) + suffix if fitted else suffix
 
 
+def _wrap_rich_text(text: str, size: int, max_width: int, bold: bool = False) -> list[str]:
+    """Wrap by grapheme cluster so names never split a combined Emoji."""
+    lines: list[str] = []
+    line: list[str] = []
+    line_width = 0.0
+    for cluster in _graphemes(str(text or "")):
+        if cluster == "\n":
+            lines.append("".join(line))
+            line = []
+            line_width = 0.0
+            continue
+        cluster_width = _rich_width(cluster, size, bold)
+        if line and line_width + cluster_width > max_width:
+            lines.append("".join(line))
+            line = []
+            line_width = 0.0
+        line.append(cluster)
+        line_width += cluster_width
+    if line or not lines:
+        lines.append("".join(line))
+    return lines
+
+
+def _baseline_for_top(font: ImageFont.ImageFont, top: float) -> float:
+    """Convert a visual top coordinate to a shared alphabetic baseline."""
+    bbox = font.getbbox("Ag中", anchor="ls")
+    return top - bbox[1]
+
+
 def _draw_rich_text(
     draw: ImageDraw.ImageDraw,
     xy: tuple[float, float],
@@ -229,23 +250,42 @@ def _draw_rich_text(
 ) -> float:
     value = _fit_rich_text(text, size, max_width, bold) if max_width else str(text or "")
     x, y = xy
+    baseline = _baseline_for_top(_load_font(size, bold=bold), y)
     for cluster in _graphemes(value):
         font, is_emoji = _font_for_cluster(cluster, size, bold)
         try:
             draw.text(
-                (x, y),
+                (x, baseline),
                 cluster,
                 font=font,
                 fill=fill,
-                anchor="lt",
+                anchor="ls",
                 embedded_color=is_emoji,
             )
         except TypeError:
             # Pillow versions before embedded_color still render monochrome
             # emoji fonts, which is preferable to dropping the nickname glyph.
-            draw.text((x, y), cluster, font=font, fill=fill, anchor="lt")
+            draw.text((x, baseline), cluster, font=font, fill=fill, anchor="ls")
         x += font.getlength(cluster)
     return x
+
+
+def _draw_wrapped_rich_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[float, float],
+    text: str,
+    size: int,
+    fill: str,
+    max_width: int,
+    *,
+    bold: bool = False,
+    line_height: int | None = None,
+) -> int:
+    lines = _wrap_rich_text(text, size, max_width, bold)
+    step = line_height or size + 8
+    for index, line in enumerate(lines):
+        _draw_rich_text(draw, (xy[0], xy[1] + index * step), line, size, fill, bold=bold)
+    return len(lines)
 
 
 def _ellipsis(text: str, font: ImageFont.ImageFont, max_width: int) -> str:
@@ -302,7 +342,14 @@ def _draw_badge(
     width = int(font.getlength(text)) + padding_x * 2
     height = 34
     draw.rounded_rectangle((left, top, left + width, top + height), radius=17, fill=background)
-    draw.text((left + padding_x, top + 7), text, font=font, fill=foreground)
+    _draw_rich_text(
+        draw,
+        (left + padding_x, top + 5),
+        text,
+        int(getattr(font, "size", 16)),
+        foreground,
+        bold=True,
+    )
     return width
 
 
@@ -326,20 +373,28 @@ def _draw_progress(
 def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -> str:
     width = 1240
     header_height = 202
-    card_height = 156
     card_gap = 16
     footer_height = 54
+    name_width = 235
+    name_line_height = 30
+    name_lines = [
+        len(_wrap_rich_text(str(row.get("name") or row.get("user_id") or "未知成员"), 27, name_width, True))
+        for row in rows
+    ]
+    card_heights = [
+        max(156, 100 + max(0, line_count - 1) * name_line_height)
+        for line_count in name_lines
+    ]
+    cards_height = sum(card_heights) + card_gap * max(len(rows) - 1, 0)
     height = max(
         360,
         header_height
-        + card_height * max(len(rows), 1)
-        + card_gap * max(len(rows) - 1, 0)
+        + (cards_height if rows else 140)
         + footer_height,
     )
     image = Image.new("RGB", (width, height), "#f5f7fc")
     draw = ImageDraw.Draw(image)
 
-    subtitle_font = _load_font(20)
     body_font = _load_font(20)
     small_font = _load_font(17)
     badge_font = _load_font(16, bold=True)
@@ -359,7 +414,7 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
     active_count = sum(row.get("status_key") == "active" for row in rows)
     upcoming_count = sum(row.get("status_key") in ("upcoming", "scheduled") for row in rows)
     subtitle = f"共 {len(rows)} 位成员  ·  {active_count} 人正在上课  ·  {upcoming_count} 人待上课"
-    draw.text((44, 92), subtitle, font=subtitle_font, fill="#dbeafe")
+    _draw_rich_text(draw, (44, 92), subtitle, 20, "#dbeafe")
 
     legend_top = 143
     legend_left = 44
@@ -370,15 +425,16 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
     ):
         _foreground, _background, accent = _status_colors(status_key)
         draw.ellipse((legend_left, legend_top + 10, legend_left + 10, legend_top + 20), fill=accent)
-        draw.text((legend_left + 18, legend_top), label, font=small_font, fill="#e2e8f0")
-        legend_left += int(small_font.getlength(label)) + 58
+        _draw_rich_text(draw, (legend_left + 18, legend_top), label, 17, "#e2e8f0")
+        legend_left += int(_rich_width(label, 17)) + 58
 
     if not rows:
         draw.rounded_rectangle((36, header_height, width - 36, header_height + 140), radius=22, fill="#ffffff")
         draw.text((width / 2, header_height + 70), "暂无成员课程数据", fill="#64748b", font=body_font, anchor="mm")
 
     for index, row in enumerate(rows):
-        top = header_height + index * (card_height + card_gap)
+        top = header_height + sum(card_heights[:index]) + index * card_gap
+        card_height = card_heights[index]
         left = 36
         right = width - 36
         status_key = str(row.get("status_key") or "none")
@@ -389,16 +445,23 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
 
         avatar = _fetch_avatar(str(row.get("user_id") or ""), 76)
         image.paste(avatar, (62, top + 40), avatar)
-        _draw_rich_text(
+        _draw_wrapped_rich_text(
             draw,
             (158, top + 31),
             str(row.get("name") or row.get("user_id") or "未知成员"),
             27,
             "#17233c",
+            name_width,
             bold=True,
-            max_width=235,
+            line_height=name_line_height,
         )
-        draw.text((158, top + 76), str(row.get("user_id") or ""), font=small_font, fill="#94a3b8")
+        _draw_rich_text(
+            draw,
+            (158, top + 76 + max(0, name_lines[index] - 1) * name_line_height),
+            str(row.get("user_id") or ""),
+            17,
+            "#94a3b8",
+        )
 
         _draw_rich_text(
             draw,
@@ -422,7 +485,7 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
         _draw_badge(draw, 972, top + 24, badge_text, badge_font, foreground, badge_background)
         countdown_label = str(row.get("countdown_label") or "")
         countdown = str(row.get("countdown") or "")
-        draw.text((972, top + 76), countdown_label, font=small_font, fill="#94a3b8")
+        _draw_rich_text(draw, (972, top + 76), countdown_label, 17, "#94a3b8")
         _draw_rich_text(
             draw,
             (972, top + 96),
@@ -433,7 +496,7 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
             max_width=right - 972 - 24,
         )
 
-    footer_top = header_height + card_height * max(len(rows), 1) + card_gap * max(len(rows) - 1, 0)
+    footer_top = header_height + (cards_height if rows else 140)
     draw.text(
         (width / 2, footer_top + 22),
         "实时状态 · 课程时间以本地时区为准",
