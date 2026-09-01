@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "schedule-manager": {
+      "title": "课表管理",
+      "description": "按群组和成员手动调整课程表。"
+    }
+  }
+}

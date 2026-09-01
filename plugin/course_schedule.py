@@ -7,15 +7,21 @@ from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
 
-from .constants import LOCAL_TZ, MAX_ICS_BYTES
+from .constants import LOCAL_TZ, MAX_EVENTS_PER_FILE, MAX_ICS_BYTES
 from .domain import (
+    _display_name,
     common_free_slots,
     daily_member_rows,
     day_occurrences,
     make_event,
     select_member_ids,
 )
-from .ics import _format_ics_schedule, _parse_schedule_ics, _serialize_schedule_ics
+from .ics import (
+    _format_ics_schedule,
+    _parse_ics_datetime_obj,
+    _parse_schedule_ics,
+    _serialize_schedule_ics,
+)
 from .render import _draw_rows_image
 from .sql_edit import apply_sql_edit_to_member
 from .sql_query import execute_course_schedule_sql
@@ -34,6 +40,201 @@ class CourseScheduleBase:
 
     async def _get_scope_members(self, event: AstrMessageEvent) -> dict[str, Any]:
         return await self._schedule_store.get_scope_members(_scope_id(event))
+
+    @staticmethod
+    def _web_datetime_value(value: str, tzid: str = "") -> str:
+        parsed = _parse_ics_datetime_obj(value, tzid)
+        return parsed.strftime("%Y-%m-%dT%H:%M") if parsed else ""
+
+    @classmethod
+    def _web_event_payload(cls, index: int, event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": index,
+            "uid": str(event.get("UID") or ""),
+            "course": str(event.get("SUMMARY") or ""),
+            "location": str(event.get("LOCATION") or ""),
+            "description": str(event.get("DESCRIPTION") or ""),
+            "start": cls._web_datetime_value(
+                str(event.get("DTSTART") or ""), str(event.get("DTSTART_TZID") or "")
+            ),
+            "end": cls._web_datetime_value(
+                str(event.get("DTEND") or ""), str(event.get("DTEND_TZID") or "")
+            ),
+            "rrule": str(event.get("RRULE") or ""),
+        }
+
+    async def _page_scopes(self) -> dict[str, Any]:
+        scopes = await self._schedule_store.list_scope_summaries()
+        result: list[dict[str, Any]] = []
+        for scope in scopes:
+            scope_id = str(scope.get("scope_id") or "")
+            if ":" in scope_id:
+                kind, target_id = scope_id.split(":", 1)
+            else:
+                kind, target_id = "other", scope_id
+            members = []
+            for member in scope.get("members", []):
+                if not isinstance(member, dict):
+                    continue
+                members.append(
+                    {
+                        "user_id": str(member.get("user_id") or ""),
+                        "name": _display_name(
+                            member.get("name") or member.get("user_id")
+                        ),
+                        "event_count": int(member.get("event_count") or 0),
+                        "revision": int(member.get("revision") or 0),
+                    }
+                )
+            result.append(
+                {
+                    "scope_id": scope_id,
+                    "kind": kind,
+                    "target_id": target_id,
+                    "label": (
+                        f"{'群聊' if kind == 'group' else '私聊' if kind == 'private' else kind} "
+                        f"{target_id}"
+                    ),
+                    "member_count": len(members),
+                    "event_count": sum(item["event_count"] for item in members),
+                    "members": members,
+                }
+            )
+        result.sort(
+            key=lambda item: (0 if item["kind"] == "group" else 1, item["target_id"])
+        )
+        return {"scopes": result}
+
+    async def _page_schedule(self, scope_id: str, user_id: str) -> dict[str, Any] | None:
+        scope = str(scope_id or "").strip()
+        member_id = str(user_id or "").strip()
+        if not scope or not member_id:
+            raise ValueError("scope_id 和 user_id 不能为空。")
+        info = await self._schedule_store.get_member(scope, member_id)
+        if not isinstance(info, dict):
+            return None
+        events = [item for item in info.get("events", []) if isinstance(item, dict)]
+        return {
+            "scope_id": scope,
+            "user_id": member_id,
+            "name": _display_name(info.get("name") or member_id),
+            "revision": int(info.get("_revision") or 0),
+            "events": [
+                self._web_event_payload(index, event)
+                for index, event in enumerate(events, 1)
+            ],
+        }
+
+    async def _save_page_schedule(
+        self, payload: dict[str, Any], *, actor: str = "webui"
+    ) -> dict[str, Any]:
+        scope_id = str(payload.get("scope_id") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        if not scope_id or not user_id:
+            raise ValueError("scope_id 和 user_id 不能为空。")
+        if not (scope_id.startswith("group:") or scope_id.startswith("private:")):
+            raise ValueError("无效的 scope_id。")
+        try:
+            expected_revision = int(payload.get("revision"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("缺少有效的课程表 revision，请刷新后重试。") from exc
+
+        raw_events = payload.get("events")
+        if not isinstance(raw_events, list):
+            raise ValueError("events 必须是数组。")
+        if len(raw_events) > MAX_EVENTS_PER_FILE:
+            raise ValueError(f"单个成员最多保存 {MAX_EVENTS_PER_FILE} 节课程。")
+
+        current = await self._schedule_store.get_member(scope_id, user_id)
+        if not isinstance(current, dict):
+            raise ValueError("找不到指定群组中的成员课程表。")
+        current_events = [
+            item for item in current.get("events", []) if isinstance(item, dict)
+        ]
+        events: list[dict[str, str]] = []
+        for index, raw in enumerate(raw_events, 1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"第 {index} 节课程格式无效。")
+            course = str(raw.get("course") or "").strip()
+            start = str(raw.get("start") or "").strip()
+            end = str(raw.get("end") or "").strip()
+            if not course:
+                raise ValueError(f"第 {index} 节课程缺少课程名称。")
+            if len(course) > 200:
+                raise ValueError(f"第 {index} 节课程名称不能超过 200 个字符。")
+            location = str(raw.get("location") or "").strip()
+            description = str(raw.get("description") or "").strip()
+            rrule = str(raw.get("rrule") or "").strip()
+            if len(location) > 200 or len(description) > 2000 or len(rrule) > 500:
+                raise ValueError(f"第 {index} 节课程的文本字段过长。")
+            try:
+                event = make_event(
+                    course,
+                    start,
+                    end,
+                    location=location,
+                    description=description,
+                    rrule=rrule,
+                    uid=str(raw.get("uid") or "").strip(),
+                )
+            except ValueError as exc:
+                raise ValueError(f"第 {index} 节课程：{exc}") from exc
+            original = None
+            uid = str(raw.get("uid") or "").strip()
+            if uid:
+                original = next(
+                    (item for item in current_events if str(item.get("UID") or "") == uid),
+                    None,
+                )
+            if original is None:
+                try:
+                    original_index = int(raw.get("id")) - 1
+                except (TypeError, ValueError):
+                    original_index = -1
+                if 0 <= original_index < len(current_events):
+                    original = current_events[original_index]
+            if original and original.get("RAW_ICAL"):
+                event["RAW_ICAL"] = str(original["RAW_ICAL"])
+            events.append(event)
+        events.sort(key=lambda item: (item.get("DTSTART", ""), item.get("DTEND", "")))
+
+        now = _now_iso()
+        updated = dict(current)
+        raw_name = payload.get("name")
+        if raw_name is not None:
+            name = _display_name(raw_name)
+            if not name:
+                raise ValueError("成员名称不能为空。")
+            if len(name) > 200:
+                raise ValueError("成员名称不能超过 200 个字符。")
+            updated["name"] = name
+        updated["events"] = events
+        updated["event_count"] = len(events)
+        updated["ics"] = _serialize_schedule_ics(events, str(current.get("ics") or ""))
+        updated["schedule"] = _format_ics_schedule(events)
+        updated["source"] = "ics"
+        updated["updated_at"] = now
+        updated["schedule_updated_at"] = now
+        updated["last_modified_at"] = now
+        updated["last_modified_by"] = str(actor or "webui")
+        await self._schedule_store.put_member(
+            scope_id,
+            user_id,
+            updated,
+            expected_revision=expected_revision,
+        )
+        saved = await self._schedule_store.get_member(scope_id, user_id)
+        return {
+            "scope_id": scope_id,
+            "user_id": user_id,
+            "name": _display_name(updated.get("name") or user_id),
+            "revision": (
+                int(saved.get("_revision") or expected_revision + 1)
+                if saved
+                else expected_revision + 1
+            ),
+            "event_count": len(events),
+        }
 
     async def _save_ics_schedule(
         self,

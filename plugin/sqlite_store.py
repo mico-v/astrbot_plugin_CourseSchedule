@@ -219,6 +219,53 @@ class SQLiteScheduleStore:
         async with self._lock:
             return self._get_scope_members_sync(scope_id)
 
+    def _list_scope_summaries_sync(self) -> list[dict[str, Any]]:
+        summaries: dict[str, dict[str, Any]] = {}
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT scope_id, user_id, data_json, revision
+                FROM schedule_members
+                ORDER BY scope_id, user_id
+                """
+            ).fetchall()
+        for row in rows:
+            scope_id = str(row["scope_id"])
+            summary = summaries.setdefault(
+                scope_id,
+                {
+                    "scope_id": scope_id,
+                    "members": [],
+                    "member_count": 0,
+                    "event_count": 0,
+                },
+            )
+            try:
+                info = json.loads(row["data_json"])
+            except (TypeError, json.JSONDecodeError):
+                info = {}
+            if not isinstance(info, dict):
+                info = {}
+            events = info.get("events")
+            event_count = int(info.get("event_count") or 0)
+            if isinstance(events, list):
+                event_count = len(events)
+            member = {
+                "user_id": str(row["user_id"]),
+                "name": str(info.get("name") or row["user_id"]),
+                "event_count": event_count,
+                "revision": int(row["revision"]),
+            }
+            summary["members"].append(member)
+            summary["member_count"] += 1
+            summary["event_count"] += event_count
+        return list(summaries.values())
+
+    async def list_scope_summaries(self) -> list[dict[str, Any]]:
+        await self.ensure_initialized()
+        async with self._lock:
+            return self._list_scope_summaries_sync()
+
     def _get_member_sync(self, scope_id: str, user_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(

@@ -5,16 +5,65 @@ import re
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.api.web import error_response, json_response, request
 
 from .plugin.constants import PLUGIN_ID
 from .plugin.course_schedule import CourseScheduleBase
 from .plugin.message_files import extract_ics_from_event
+from .plugin.sqlite_store import ScheduleWriteConflict
 
 
 @register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.1")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        context.register_web_api(
+            f"/{PLUGIN_ID}/scopes",
+            self._web_scopes,
+            ["GET"],
+            "List course schedule scopes and members",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/schedule",
+            self._web_schedule,
+            ["GET"],
+            "Get one member course schedule",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/schedule/save",
+            self._web_save_schedule,
+            ["POST"],
+            "Save one member course schedule",
+        )
+
+    async def _web_scopes(self):
+        return json_response(await self._page_scopes())
+
+    async def _web_schedule(self):
+        scope_id = str(request.query.get("scope_id") or "").strip()
+        user_id = str(request.query.get("user_id") or "").strip()
+        try:
+            schedule = await self._page_schedule(scope_id, user_id)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        if schedule is None:
+            return error_response("找不到指定成员的课程表。", status_code=404)
+        return json_response(schedule)
+
+    async def _web_save_schedule(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。", status_code=400)
+        try:
+            saved = await self._save_page_schedule(
+                payload,
+                actor=str(request.username or "webui"),
+            )
+        except ScheduleWriteConflict as exc:
+            return error_response(str(exc), status_code=409)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(saved)
 
     @filter.command("今日课表")
     async def today_schedule(self, event: AstrMessageEvent):

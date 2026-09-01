@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>课表管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">COURSE SCHEDULE</p>
+          <h1>课表管理</h1>
+          <p class="hero-copy">按群组和成员手动维护课程，保存后会同步更新图片课表、查询结果和本地 ICS。</p>
+        </div>
+        <button id="refreshButton" class="button button-ghost" type="button">刷新数据</button>
+      </header>
+
+      <section id="notice" class="notice" role="status" aria-live="polite"></section>
+
+      <section class="workspace">
+        <aside class="sidebar panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">SCOPE</p>
+          <h2>会话</h2>
+            </div>
+            <span id="scopeCount" class="count-pill">0</span>
+          </div>
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input id="scopeSearch" type="search" placeholder="搜索群号或成员" autocomplete="off" />
+          </label>
+          <div id="scopeList" class="scope-list"></div>
+        </aside>
+
+        <section class="content panel">
+          <div id="emptyState" class="empty-state">
+            <div class="empty-icon">✦</div>
+            <h2>选择一个成员开始编辑</h2>
+            <p>从左侧选择群组和成员，就可以添加、修改或删除课程。</p>
+          </div>
+
+          <div id="editor" class="editor hidden">
+            <div class="editor-heading">
+              <div>
+                <p id="scopeLabel" class="section-kicker">群组</p>
+                <h2 id="memberTitle">成员课表</h2>
+                <p id="memberMeta" class="muted"></p>
+              </div>
+              <div class="editor-actions">
+                <span id="dirtyMark" class="dirty-mark hidden">有未保存修改</span>
+                <button id="saveButton" class="button button-primary" type="button">保存课表</button>
+              </div>
+            </div>
+
+            <div class="member-fields">
+              <label class="field compact-field">
+                <span>显示名称</span>
+                <input id="memberName" type="text" maxlength="200" />
+              </label>
+              <div class="member-tip">QQ 号 <strong id="memberId"></strong> · 修改名称不会改变成员身份</div>
+            </div>
+
+            <div class="course-toolbar">
+              <div>
+                <h3>课程列表</h3>
+                <p class="muted">时间按本地时区保存；重复课程可填写 iCalendar RRULE。</p>
+              </div>
+              <button id="addCourseButton" class="button button-secondary" type="button">＋ 添加课程</button>
+            </div>
+
+            <div id="courseList" class="course-list"></div>
+            <div id="noCourses" class="no-courses hidden">暂无课程，点击“添加课程”创建第一节课。</div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="courseTemplate">
+      <article class="course-card">
+        <div class="course-card-head">
+          <div class="course-index"></div>
+          <button class="remove-course" type="button" title="删除课程">删除</button>
+        </div>
+        <div class="course-grid">
+          <label class="field course-name-field">
+            <span>课程名称 <b>*</b></span>
+            <input data-field="course" type="text" maxlength="200" placeholder="例如：高等数学" />
+          </label>
+          <label class="field">
+            <span>上课时间 <b>*</b></span>
+            <input data-field="start" type="datetime-local" />
+          </label>
+          <label class="field">
+            <span>下课时间 <b>*</b></span>
+            <input data-field="end" type="datetime-local" />
+          </label>
+          <label class="field">
+            <span>地点</span>
+            <input data-field="location" type="text" maxlength="200" placeholder="例如：A101" />
+          </label>
+          <label class="field field-wide">
+            <span>重复规则 <small>可选</small></span>
+            <input data-field="rrule" type="text" maxlength="500" placeholder="例如：FREQ=WEEKLY;BYDAY=MO" />
+          </label>
+          <label class="field field-wide">
+            <span>备注</span>
+            <textarea data-field="description" rows="2" maxlength="2000" placeholder="教师、班级或其他备注"></textarea>
+          </label>
+        </div>
+      </article>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
