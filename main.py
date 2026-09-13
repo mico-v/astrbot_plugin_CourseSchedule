@@ -11,9 +11,10 @@ from .plugin.constants import PLUGIN_ID
 from .plugin.course_schedule import CourseScheduleBase
 from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
+from .plugin.texts import _command_tail
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.8.4")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.9.0")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -86,15 +87,7 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
     @filter.command("课表")
     async def schedule(self, event: AstrMessageEvent, query: str = ""):
         """查询指定日期课程表，例如 /课表 或 /课表 2026-09-01。"""
-        value = str(query or "").strip()
-        if not value:
-            try:
-                getter = getattr(event, "get_message_str", None)
-                raw = str(getter() if callable(getter) else getattr(event, "message_str", "") or "")
-                parts = raw.strip().split(maxsplit=1)
-                value = parts[1].strip() if len(parts) == 2 else ""
-            except Exception:
-                value = ""
+        value = _command_tail(event, query)
         target = None
         if value:
             try:
@@ -105,6 +98,19 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         path = await self._group_schedule_image(event, target)
         if not path:
             yield event.plain_result("当前会话还没有可展示的课程表。")
+            return
+        yield event.image_result(path)
+
+    @filter.command("上课时长榜", alias={"上课排行", "本周上课排行", "学习时长榜"})
+    async def rank_board(self, event: AstrMessageEvent, query: str = ""):
+        """生成本会话群友上课时长排行榜，例如 /上课时长榜 或 /上课时长榜 本月。"""
+        try:
+            path = await self._rank_board_image(event, _command_tail(event, query))
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if not path:
+            yield event.plain_result("当前会话还没有可统计的课程。")
             return
         yield event.image_result(path)
 

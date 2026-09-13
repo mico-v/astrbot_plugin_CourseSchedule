@@ -75,10 +75,15 @@ def _parse_sql_time_range(
     elif compact in {"nextweek", "下周", "下一周"}:
         start_date = today - timedelta(days=today.weekday()) + timedelta(days=7)
         end_date = start_date + timedelta(days=6)
+    elif compact in {"lastweek", "prevweek", "上周", "上一周"}:
+        start_date = today - timedelta(days=today.weekday()) - timedelta(days=7)
+        end_date = start_date + timedelta(days=6)
     elif compact in {"thismonth", "currentmonth", "month", "本月", "这个月"}:
         start_date, end_date = _month_bounds(today)
     elif compact in {"nextmonth", "下月", "下个月"}:
         start_date, end_date = _month_bounds(today, 1)
+    elif compact in {"lastmonth", "prevmonth", "上月", "上个月"}:
+        start_date, end_date = _month_bounds(today, -1)
     else:
         parts = [part for part in _RANGE_SPLIT_RE.split(normalized, maxsplit=1) if part]
         if len(parts) == 2:

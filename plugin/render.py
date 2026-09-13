@@ -326,7 +326,71 @@ def _status_colors(status_key: str) -> tuple[str, str, str]:
         "finished": ("#64748b", "#f1f5f9", "#94a3b8"),
         "scheduled": ("#7c3aed", "#ede9fe", "#a78bfa"),
         "none": ("#64748b", "#f8fafc", "#cbd5e1"),
+        "rank1": ("#b45309", "#fef3c7", "#f59e0b"),
+        "rank2": ("#475569", "#e2e8f0", "#94a3b8"),
+        "rank3": ("#9a3412", "#ffedd5", "#fb923c"),
+        "rank": ("#1d4ed8", "#dbeafe", "#60a5fa"),
     }.get(status_key, ("#475569", "#f1f5f9", "#94a3b8"))
+
+
+def _rank_status_key(rank: int) -> str:
+    if rank <= 0:
+        return "none"
+    return "rank" if rank > 3 else f"rank{rank}"
+
+
+def _rank_card(row: dict[str, object]) -> dict[str, object]:
+    """Map one ranking row onto the shared course-card layout."""
+    rank = int(row.get("rank") or 0)
+    if rank:
+        duration = (
+            f"已上 {row.get('elapsed_text') or '0分钟'}"
+            f" / 共 {row.get('hours_text') or '0分钟'}"
+        )
+        countdown = f"{round(float(row.get('progress') or 0.0) * 100)}%"
+    else:
+        duration = "统计区间内没有课程"
+        countdown = "—"
+    return {
+        "user_id": str(row.get("user_id") or ""),
+        "name": str(row.get("name") or row.get("user_id") or "未知成员"),
+        "status_key": _rank_status_key(rank),
+        "status": f"#{rank}" if rank else "无课",
+        "course": str(row.get("hours_text") or "0分钟"),
+        "time": (
+            f"{int(row.get('course_count') or 0)} 节 · "
+            f"{int(row.get('course_names') or 0)} 门课"
+        ),
+        "duration": duration,
+        "progress": float(row.get("progress") or 0.0),
+        "countdown_label": "时长占比",
+        "countdown": countdown,
+    }
+
+
+def _draw_rank_image(
+    title: str,
+    rows: list[dict[str, object]],
+    filename: str,
+    *,
+    subtitle: str,
+    footer: str,
+    top_n: int = 0,
+) -> str:
+    """Render a class-hours leaderboard on the shared member-card layout."""
+    shown = rows[:top_n] if top_n and len(rows) > top_n else rows
+    return _draw_rows_image(
+        title,
+        [_rank_card(row) for row in shown],
+        filename,
+        subtitle=subtitle,
+        legend=[
+            ("none", "同一时段冲突的课程只计一次"),
+            ("none", "全天日程不计入时长"),
+        ],
+        duration_label="",
+        footer=footer,
+    )
 
 
 def _draw_badge(
@@ -370,7 +434,16 @@ def _draw_progress(
         )
 
 
-def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -> str:
+def _draw_rows_image(
+    title: str,
+    rows: list[dict[str, object]],
+    filename: str,
+    *,
+    subtitle: str | None = None,
+    legend: list[tuple[str, str]] | None = None,
+    duration_label: str = "本节持续",
+    footer: str = "实时状态 · 课程时间以本地时区为准",
+) -> str:
     width = 1240
     header_height = 202
     card_gap = 16
@@ -411,18 +484,29 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
     draw.ellipse((width - 190, -105, width + 70, 155), fill="#496a9d")
     draw.ellipse((width - 90, 70, width + 90, 250), fill="#3e5b8d")
     _draw_rich_text(draw, (42, 32), title, 40, "#ffffff", bold=True, max_width=760)
-    active_count = sum(row.get("status_key") == "active" for row in rows)
-    upcoming_count = sum(row.get("status_key") in ("upcoming", "scheduled") for row in rows)
-    subtitle = f"共 {len(rows)} 位成员  ·  {active_count} 人正在上课  ·  {upcoming_count} 人待上课"
+    if subtitle is None:
+        active_count = sum(row.get("status_key") == "active" for row in rows)
+        upcoming_count = sum(
+            row.get("status_key") in ("upcoming", "scheduled") for row in rows
+        )
+        subtitle = (
+            f"共 {len(rows)} 位成员  ·  {active_count} 人正在上课  ·  "
+            f"{upcoming_count} 人待上课"
+        )
     _draw_rich_text(draw, (44, 92), subtitle, 20, "#dbeafe")
 
     legend_top = 143
     legend_left = 44
-    for status_key, label in (
-        ("active", "正在上课"),
-        ("upcoming", "下一节即将上"),
-        ("finished", "今日已结束"),
-    ):
+    legend_items = (
+        (
+            ("active", "正在上课"),
+            ("upcoming", "下一节即将上"),
+            ("finished", "今日已结束"),
+        )
+        if legend is None
+        else legend
+    )
+    for status_key, label in legend_items:
         _foreground, _background, accent = _status_colors(status_key)
         draw.ellipse((legend_left, legend_top + 10, legend_left + 10, legend_top + 20), fill=accent)
         _draw_rich_text(draw, (legend_left + 18, legend_top), label, 17, "#e2e8f0")
@@ -478,7 +562,8 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
             time_text += f"   ·   {location}"
         _draw_rich_text(draw, (430, top + 66), time_text, 19, "#64748b", max_width=480)
         duration = str(row.get("duration") or "—")
-        _draw_rich_text(draw, (430, top + 101), f"本节持续 {duration}", 17, "#94a3b8", max_width=480)
+        duration_text = f"{duration_label} {duration}".strip()
+        _draw_rich_text(draw, (430, top + 101), duration_text, 17, "#94a3b8", max_width=480)
         _draw_progress(draw, 430, top + 132, 480, float(row.get("progress") or 0), accent)
 
         badge_text = str(row.get("status") or "")
@@ -499,7 +584,7 @@ def _draw_rows_image(title: str, rows: list[dict[str, object]], filename: str) -
     footer_top = header_height + (cards_height if rows else 140)
     draw.text(
         (width / 2, footer_top + 22),
-        "实时状态 · 课程时间以本地时区为准",
+        footer,
         font=small_font,
         fill="#94a3b8",
         anchor="mm",

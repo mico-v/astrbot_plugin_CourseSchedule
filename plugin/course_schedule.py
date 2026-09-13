@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -9,6 +10,7 @@ from astrbot.api.event import AstrMessageEvent
 from .constants import LOCAL_TZ, MAX_EVENTS_PER_FILE, MAX_ICS_BYTES
 from .domain import (
     _display_name,
+    _format_duration_minutes,
     daily_member_rows,
     make_event,
 )
@@ -19,7 +21,13 @@ from .ics import (
     _serialize_schedule_ics,
 )
 from .occurrences import _event_datetimes, _expand_event_occurrences
-from .render import _draw_rows_image
+from .rank import (
+    DEFAULT_RANK_PERIOD,
+    DEFAULT_RANK_TOP_N,
+    RANK_MAX_RANGE_DAYS,
+    build_rank_rows,
+)
+from .render import _draw_rank_image, _draw_rows_image
 from .sql_query import _parse_sql_time_range
 from .sqlite_store import ScheduleWriteConflict, SQLiteScheduleStore
 from .store import _scope_id
@@ -955,8 +963,10 @@ class CourseScheduleBase:
         now = datetime.now(LOCAL_TZ)
         selected_date = target_date or now.date()
         rows = daily_member_rows(members, selected_date, now=now)
-        return _draw_rows_image(
-            f"课程表 · {selected_date:%Y-%m-%d}",
+        title = f"课程表 · {selected_date:%Y-%m-%d}"
+        return await asyncio.to_thread(
+            _draw_rows_image,
+            title,
             rows,
             f"schedule_{selected_date:%Y%m%d}.png",
         )
@@ -967,3 +977,47 @@ class CourseScheduleBase:
     async def _group_tomorrow_image(self, event: AstrMessageEvent) -> str | None:
         tomorrow = datetime.now(LOCAL_TZ).date() + timedelta(days=1)
         return await self._group_schedule_image(event, tomorrow)
+
+    async def _rank_board_rows(
+        self, event: AstrMessageEvent, period: str = ""
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Return (rank rows, range label) for the current session scope.
+
+        Rows cover the whole window, including classes that have not happened
+        yet; each row carries the already finished part separately.
+        """
+        members = await self._get_scope_members(event)
+        if not members:
+            return [], ""
+        now = datetime.now(LOCAL_TZ)
+        raw = str(period or "").strip() or DEFAULT_RANK_PERIOD
+        try:
+            start_bound, end_bound, label = _parse_sql_time_range(raw, now.date())
+        except ValueError as exc:
+            raise ValueError(
+                "无法识别统计范围，请使用 今日、本周、上周、本月、下月，"
+                "或 2026-09-01..2026-09-30 这样的日期范围；结束日期不能早于开始日期。"
+            ) from exc
+        if (end_bound - start_bound).days > RANK_MAX_RANGE_DAYS:
+            raise ValueError(f"统计范围最长 {RANK_MAX_RANGE_DAYS} 天，请缩小范围。")
+        return build_rank_rows(members, start_bound, end_bound, now=now), label
+
+    async def _rank_board_image(
+        self, event: AstrMessageEvent, period: str = ""
+    ) -> str | None:
+        rows, label = await self._rank_board_rows(event, period)
+        if not rows:
+            return None
+        total_text = _format_duration_minutes(sum(row["minutes"] for row in rows))
+        footer = "重复课程按 RRULE 展开 · 时间以本地时区为准"
+        if len(rows) > DEFAULT_RANK_TOP_N:
+            footer += f" · 仅展示前 {DEFAULT_RANK_TOP_N} 名"
+        return await asyncio.to_thread(
+            _draw_rank_image,
+            "群友上课时长榜",
+            rows,
+            f"rank_{label.replace('..', '_').replace('-', '')}.png",
+            subtitle=f"{label}  ·  共 {len(rows)} 位成员  ·  合计 {total_text}",
+            footer=footer,
+            top_n=DEFAULT_RANK_TOP_N,
+        )
