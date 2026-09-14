@@ -7,7 +7,18 @@ from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
 
-from .constants import LOCAL_TZ, MAX_EVENTS_PER_FILE, MAX_ICS_BYTES
+from .constants import (
+    DAY_OVERRIDE_ALL,
+    DAY_OVERRIDE_HOLIDAY,
+    DAY_OVERRIDE_SHIFT,
+    LOCAL_TZ,
+    MAX_DAY_OVERRIDE_RANGE_DAYS,
+    MAX_DAY_OVERRIDE_SPAN_DAYS,
+    MAX_DAY_OVERRIDES_PER_SCOPE,
+    MAX_EVENTS_PER_FILE,
+    MAX_ICS_BYTES,
+)
+from .day_off import day_count_text, format_day_list, split_day_override_args
 from .domain import (
     _display_name,
     _format_duration_minutes,
@@ -20,7 +31,11 @@ from .ics import (
     _parse_schedule_ics,
     _serialize_schedule_ics,
 )
-from .occurrences import _event_datetimes, _expand_event_occurrences
+from .occurrences import (
+    _event_datetimes,
+    _expand_indexed_occurrences,
+    _member_day_overrides,
+)
 from .rank import (
     DEFAULT_RANK_PERIOD,
     DEFAULT_RANK_TOP_N,
@@ -377,6 +392,16 @@ class CourseScheduleBase:
         }.get(normalized, "")
 
     @staticmethod
+    def _event_is_admin(event: AstrMessageEvent) -> bool:
+        checker = getattr(event, "is_admin", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    @staticmethod
     def _agent_text(value: Any) -> str:
         return _display_name(value).strip()
 
@@ -672,11 +697,12 @@ class CourseScheduleBase:
                     if start and end:
                         occurrences.append((index, {**source_event, "_start": start, "_end": end}))
             else:
-                for index, source_event in enumerate(source_events, 1):
-                    for occurrence in _expand_event_occurrences(
-                        source_event, start_bound, end_bound
-                    ):
-                        occurrences.append((index, occurrence))
+                occurrences = _expand_indexed_occurrences(
+                    source_events,
+                    _member_day_overrides(info),
+                    start_bound,
+                    end_bound,
+                )
 
             for course_id, occurrence in occurrences:
                 start = occurrence["_start"]
@@ -701,6 +727,7 @@ class CourseScheduleBase:
                     "duration": duration_minutes,
                     "status": status,
                     "rrule": self._agent_text(occurrence.get("RRULE")),
+                    "shifted_from": self._agent_text(occurrence.get("_shifted_from")),
                 }
                 if field_name:
                     if field_name == "course" and normalized_value not in course.casefold():
@@ -773,6 +800,8 @@ class CourseScheduleBase:
                 f"状态：{row['status']}",
                 f"时长：{row['duration']}分钟",
             ]
+            if row["shifted_from"]:
+                details.append(f"调休自 {row['shifted_from']}")
             if row["location"]:
                 details.append(f"地点：{row['location']}")
             if row["description"]:
@@ -826,13 +855,7 @@ class CourseScheduleBase:
             return "没有确定要修改的成员。"
         target_id = target_ids[0]
         group_id = str(event.get_group_id() or "").strip()
-        is_admin = False
-        checker = getattr(event, "is_admin", None)
-        if callable(checker):
-            try:
-                is_admin = bool(checker())
-            except Exception:
-                is_admin = False
+        is_admin = self._event_is_admin(event)
         if target_id != sender_id and (not group_id or not is_admin):
             if group_id:
                 return "普通成员只能修改自己的课表；修改群内其他成员的课表需要管理员权限。"
@@ -952,6 +975,286 @@ class CourseScheduleBase:
             updated,
             expected_revision=int(info.get("_revision") or 0),
         )
+
+    # ------------------------------------------------------------------
+    # 休假 / 调休 markers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _day_override_label(cls, members: dict[str, Any], target_id: str) -> str:
+        if target_id == DAY_OVERRIDE_ALL:
+            return "全体成员"
+        info = members.get(target_id) if isinstance(members, dict) else None
+        if isinstance(info, dict):
+            name = cls._agent_text(info.get("name"))
+            if name:
+                return f"{name}({target_id})"
+        return str(target_id)
+
+    async def _day_override_targets(
+        self, event: AstrMessageEvent, person: str
+    ) -> tuple[list[str], str | None, dict[str, Any]]:
+        """Resolve who a 休假/调休 command applies to.
+
+        An admin in a group defaults to every member, and may name one member
+        or @ them instead.  Everyone else can only ever mark themselves, which
+        is the same rule the edit tool uses.
+        """
+        members = await self._get_scope_members(event)
+        sender_id = str(event.get_sender_id())
+        group_id = str(event.get_group_id() or "").strip()
+        is_admin = bool(group_id) and self._event_is_admin(event)
+        query = self._agent_text(person)
+
+        if not query or _is_own_query(query):
+            return ([DAY_OVERRIDE_ALL] if is_admin else [sender_id]), None, members
+        if not group_id:
+            return [], "私聊只能标记自己的假期。", members
+        if query.lower() in {"all", "全部", "所有", "大家", "全体", "全群"}:
+            if is_admin:
+                return [DAY_OVERRIDE_ALL], None, members
+            return [], "只有管理员可以把标记应用到全体成员。", members
+
+        target_ids, error = self._agent_member_ids(
+            members, query, sender_id, allow_unknown_create=is_admin
+        )
+        if error and is_admin:
+            mentioned, mention_error = self._agent_mention_target(event, query)
+            if mentioned:
+                target_ids, error = [mentioned], None
+            elif mention_error:
+                error = f"{error} {mention_error}"
+        if error:
+            return [], error, members
+        if not target_ids:
+            return [], "没有找到要标记的成员。", members
+
+        target_id = target_ids[0]
+        if target_id == sender_id:
+            return [target_id], None, members
+        if not is_admin:
+            return (
+                [],
+                "普通成员只能标记自己的假期；标记群内其他成员的假期需要管理员权限。",
+                members,
+            )
+        return [target_id], None, members
+
+    async def _existing_day_overrides(self, scope: str) -> dict[str, dict[str, str]]:
+        return {
+            f"{row['user_id']}:{row['day']}": row
+            for row in await self._schedule_store.list_day_overrides(scope)
+        }
+
+    async def _set_day_override_text(
+        self,
+        event: AstrMessageEvent,
+        kind: str,
+        days: list[date],
+        *,
+        source_day: date | None = None,
+        person: str = "",
+    ) -> str:
+        if not days:
+            return "请提供要标记的日期，例如 /休假 2026-10-01。"
+        if len(days) > MAX_DAY_OVERRIDE_RANGE_DAYS:
+            return f"一次最多标记 {MAX_DAY_OVERRIDE_RANGE_DAYS} 天，请拆分后重试。"
+        targets, error, members = await self._day_override_targets(event, person)
+        if error:
+            return error
+        if not targets:
+            return "没有确定要标记的成员。"
+        if kind == DAY_OVERRIDE_SHIFT:
+            if source_day is None:
+                return "调休需要同时提供来源日期，例如 /调休 2026-10-11 2026-10-08。"
+            if source_day in set(days):
+                return "调休的来源日期不能和调休日期相同。"
+            if abs((source_day - days[0]).days) > MAX_DAY_OVERRIDE_SPAN_DAYS:
+                return (
+                    "调休的来源日期与目标日期相差不能超过 "
+                    f"{MAX_DAY_OVERRIDE_SPAN_DAYS} 天。"
+                )
+
+        scope = _scope_id(event)
+        existing = await self._existing_day_overrides(scope)
+        keys = [f"{target_id}:{day.isoformat()}" for target_id in targets for day in days]
+        added = len({key for key in keys if key not in existing})
+        if len(existing) + added > MAX_DAY_OVERRIDES_PER_SCOPE:
+            return (
+                f"本会话的休假/调休标记已达上限 {MAX_DAY_OVERRIDES_PER_SCOPE} 条，"
+                "请先取消一些标记。"
+            )
+
+        source_text = (
+            source_day.isoformat()
+            if source_day is not None and kind == DAY_OVERRIDE_SHIFT
+            else ""
+        )
+        now = _now_iso()
+        sender_id = str(event.get_sender_id())
+        for target_id in targets:
+            for day in days:
+                await self._schedule_store.set_day_override(
+                    scope,
+                    target_id,
+                    day.isoformat(),
+                    kind,
+                    source_day=source_text,
+                    created_by=sender_id,
+                    created_at=now,
+                )
+
+        replaced = any(
+            existing.get(key, {}).get("kind") not in (None, kind) for key in keys
+        )
+        day_text = format_day_list(days)
+        label = (
+            "、".join(
+                self._day_override_label(members, target_id) for target_id in targets
+            )
+            + day_count_text(days)
+        )
+        if kind == DAY_OVERRIDE_SHIFT:
+            action = (
+                f"已将 {day_text} 标记为调休（{label}）："
+                f"当天课程改为 {source_day:%Y-%m-%d} 的课程。"
+            )
+        else:
+            action = f"已将 {day_text} 标记为休假（{label}）：当天课程全部取消。"
+        notes: list[str] = []
+        if replaced:
+            notes.append("原有标记已被覆盖")
+        if min(days) < datetime.now(LOCAL_TZ).date():
+            notes.append("包含已过去的日期，只影响查询与统计")
+        return action + (f"（{'，'.join(notes)}）" if notes else "")
+
+    async def _clear_day_override_text(
+        self, event: AstrMessageEvent, days: list[date], *, person: str = ""
+    ) -> str:
+        if not days:
+            return "请提供要取消标记的日期，例如 /销假 2026-10-01。"
+        targets, error, members = await self._day_override_targets(event, person)
+        if error:
+            return error
+        if not targets:
+            return "没有确定要取消标记的成员。"
+
+        scope = _scope_id(event)
+        existing = await self._existing_day_overrides(scope)
+        removed: list[date] = []
+        removed_kinds: set[str] = set()
+        scope_wide: list[date] = []
+        for target_id in targets:
+            for day in days:
+                key = f"{target_id}:{day.isoformat()}"
+                row = existing.get(key)
+                if row is None:
+                    if target_id != DAY_OVERRIDE_ALL and (
+                        f"{DAY_OVERRIDE_ALL}:{day.isoformat()}" in existing
+                    ):
+                        scope_wide.append(day)
+                    continue
+                if await self._schedule_store.delete_day_override(
+                    scope, target_id, day.isoformat()
+                ):
+                    removed.append(day)
+                    removed_kinds.add(str(row["kind"]))
+
+        if not removed and not scope_wide:
+            return f"{format_day_list(days)} 没有可取消的休假/调休标记。"
+        kind_text = (
+            "休假"
+            if removed_kinds == {DAY_OVERRIDE_HOLIDAY}
+            else "调休"
+            if removed_kinds == {DAY_OVERRIDE_SHIFT}
+            else "休假/调休"
+        )
+        label = (
+            "、".join(
+                self._day_override_label(members, target_id) for target_id in targets
+            )
+            + day_count_text(removed or days)
+        )
+        parts: list[str] = []
+        if removed:
+            parts.append(f"已取消 {format_day_list(removed)} 的{kind_text}标记（{label}）。")
+        if scope_wide:
+            parts.append(
+                f"{format_day_list(scope_wide)} 是面向全体成员的标记，"
+                "请让管理员使用 /销假 取消。"
+            )
+        return "".join(parts)
+
+    async def _day_override_list_text(self, event: AstrMessageEvent) -> str:
+        scope = _scope_id(event)
+        rows = await self._schedule_store.list_day_overrides(scope)
+        if not rows:
+            return (
+                "当前会话还没有休假/调休标记。\n"
+                "/休假 <日期> [成员] 取消当天全部课程；"
+                "/调休 <日期> <来源日期> [成员] 改为上来源日期的课程。"
+            )
+        members = await self._get_scope_members(event)
+        today = datetime.now(LOCAL_TZ).date()
+        shown = rows[:50]
+        lines = [f"当前会话的休假/调休标记（共 {len(rows)} 条）："]
+        for row in shown:
+            day = date.fromisoformat(row["day"])
+            label = self._day_override_label(members, row["user_id"])
+            day_text = f"{day:%Y-%m-%d}" + ("（已过去）" if day < today else "")
+            if row["kind"] == DAY_OVERRIDE_SHIFT and row["source_day"]:
+                source = date.fromisoformat(row["source_day"])
+                lines.append(
+                    f"- {day_text} 调休：按 {source:%Y-%m-%d} 的课程上课（{label}）"
+                )
+            else:
+                lines.append(f"- {day_text} 休假：当天课程全部取消（{label}）")
+        if len(rows) > len(shown):
+            lines.append(f"共 {len(rows)} 条，仅展示前 {len(shown)} 条。")
+        lines.append("取消标记：/销假 <日期> [成员]")
+        return "\n".join(lines)
+
+    async def _day_override_command_text(
+        self, event: AstrMessageEvent, tail: str, kind: str
+    ) -> str:
+        """Parse a 休假/调休 command tail and apply the marker."""
+        today = datetime.now(LOCAL_TZ).date()
+        try:
+            days, rest = split_day_override_args(tail, today)
+        except ValueError as exc:
+            return str(exc)
+        person = " ".join(rest)
+        if not days:
+            if kind == DAY_OVERRIDE_SHIFT:
+                return (
+                    "请提供两个日期：/调休 <被覆盖的日期> <来源日期> [成员]，"
+                    "例如 /调休 2026-10-11 2026-10-08 表示 10 月 11 日按 10 月 8 日的课程上课。"
+                )
+            return (
+                "请提供日期：/休假 <日期> [成员]，例如 /休假 2026-10-01，"
+                "也可以使用 今天、明天 或 10月1日至10月8日。"
+            )
+        if kind == DAY_OVERRIDE_SHIFT:
+            if len(days) < 2:
+                return "调休需要来源日期：/调休 <被覆盖的日期> <来源日期> [成员]。"
+            if len(days) > 2:
+                return "调休一次只能指定一个日期和一个来源日期，例如 /调休 2026-10-11 2026-10-08。"
+            return await self._set_day_override_text(
+                event, kind, days[:1], source_day=days[1], person=person
+            )
+        return await self._set_day_override_text(event, kind, days, person=person)
+
+    async def _day_override_clear_command_text(
+        self, event: AstrMessageEvent, tail: str
+    ) -> str:
+        today = datetime.now(LOCAL_TZ).date()
+        try:
+            days, rest = split_day_override_args(tail, today)
+        except ValueError as exc:
+            return str(exc)
+        if not days:
+            return "请提供日期：/销假 <日期> [成员]，例如 /销假 2026-10-01。"
+        return await self._clear_day_override_text(event, days, person=" ".join(rest))
 
     async def _group_schedule_image(
         self, event: AstrMessageEvent, target_date: date | None = None

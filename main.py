@@ -7,14 +7,18 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, json_response, request
 
-from .plugin.constants import PLUGIN_ID
+from .plugin.constants import (
+    DAY_OVERRIDE_HOLIDAY,
+    DAY_OVERRIDE_SHIFT,
+    PLUGIN_ID,
+)
 from .plugin.course_schedule import CourseScheduleBase
 from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
-from .plugin.texts import _command_tail
+from .plugin.texts import _command_tail, _full_command_tail
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.9.0")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.10.0")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -113,6 +117,47 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
             yield event.plain_result("当前会话还没有可统计的课程。")
             return
         yield event.image_result(path)
+
+    @filter.command("休假", alias={"放假"})
+    async def day_off(self, event: AstrMessageEvent, query: str = ""):
+        """标记某天为假期，当天的课程全部取消。
+
+        管理员默认标记全体成员，也可以 @ 或填写 QQ 号/完整昵称单独指定成员；
+        普通成员只能标记自己的假期。
+        """
+        yield event.plain_result(
+            await self._day_override_command_text(
+                event, _full_command_tail(event, query), DAY_OVERRIDE_HOLIDAY
+            )
+        )
+
+    @filter.command("调休", alias={"补课", "调课"})
+    async def make_up_day(self, event: AstrMessageEvent, query: str = ""):
+        """把某天的课程换成另一天的课程。
+
+        第一个日期是被覆盖的日子，第二个日期是课程来源，例如
+        /调休 2026-10-11 2026-10-08 表示 10 月 11 日按 10 月 8 日的课程上课。
+        权限与 /休假 相同。
+        """
+        yield event.plain_result(
+            await self._day_override_command_text(
+                event, _full_command_tail(event, query), DAY_OVERRIDE_SHIFT
+            )
+        )
+
+    @filter.command("销假", alias={"取消休假", "取消调休"})
+    async def cancel_day_off(self, event: AstrMessageEvent, query: str = ""):
+        """取消某天的休假/调休标记，权限与 /休假 相同。"""
+        yield event.plain_result(
+            await self._day_override_clear_command_text(
+                event, _full_command_tail(event, query)
+            )
+        )
+
+    @filter.command("假期", alias={"假期列表", "调休列表", "休假列表"})
+    async def day_off_list(self, event: AstrMessageEvent):
+        """列出当前会话的休假/调休标记。"""
+        yield event.plain_result(await self._day_override_list_text(event))
 
     async def _import_ics_event(self, event: AstrMessageEvent):
         if getattr(event, "_course_schedule_ics_imported", False):

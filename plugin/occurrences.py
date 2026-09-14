@@ -6,7 +6,7 @@ from typing import Any
 from dateutil.rrule import rrulestr
 from icalendar import Event
 
-from .constants import LOCAL_TZ
+from .constants import DAY_OVERRIDE_HOLIDAY, DAY_OVERRIDE_SHIFT, LOCAL_TZ
 from .ics import _parse_ics_datetime_obj
 
 
@@ -115,6 +115,107 @@ def _expand_event_occurrences(
     return deduplicated
 
 
+def _parse_day_text(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "").strip())
+    except ValueError:
+        return None
+
+
+def _member_day_overrides(member_info: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Return ``{"YYYY-MM-DD": {"kind", "source_day"}}`` for one member.
+
+    The store merges the scope-wide (all-members) markers with the member's own
+    markers before attaching them, so a member entry always wins over the
+    scope entry for the same day.
+    """
+    raw = member_info.get("_day_overrides") if isinstance(member_info, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    overrides: dict[str, dict[str, str]] = {}
+    for day, rule in raw.items():
+        if not isinstance(rule, dict):
+            continue
+        parsed_day = _parse_day_text(day)
+        if parsed_day is None:
+            continue
+        kind = str(rule.get("kind") or "").strip().lower()
+        if kind == DAY_OVERRIDE_HOLIDAY:
+            overrides[parsed_day.isoformat()] = {"kind": kind, "source_day": ""}
+        elif kind == DAY_OVERRIDE_SHIFT:
+            source = _parse_day_text(rule.get("source_day"))
+            if source is not None:
+                overrides[parsed_day.isoformat()] = {
+                    "kind": kind,
+                    "source_day": source.isoformat(),
+                }
+    return overrides
+
+
+def _expand_events_on_day(
+    events: list[dict[str, Any]], day: date
+) -> list[tuple[int, dict[str, Any]]]:
+    """Expand every event over one calendar day, keeping the source event index."""
+    day_start = datetime.combine(day, time.min, tzinfo=LOCAL_TZ)
+    day_end = day_start + timedelta(days=1)
+    found: list[tuple[int, dict[str, Any]]] = []
+    for index, event in enumerate(events, start=1):
+        for occurrence in _expand_event_occurrences(event, day_start, day_end):
+            if occurrence["_start"].date() == day:
+                found.append((index, occurrence))
+    return found
+
+
+def _expand_indexed_occurrences(
+    events: list[dict[str, Any]],
+    overrides: dict[str, dict[str, str]],
+    start_bound: datetime,
+    end_bound: datetime,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Expand events for a window, applying 休假/调休 markers.
+
+    A day marked 休假 loses every occurrence that starts on it.  A day marked
+    调休 loses its own occurrences and shows the source day's courses instead,
+    shifted to the same clock times.  The source day is read from the stored
+    events directly, so marking the source day 休假 as well (the usual holiday
+    announcement) does not empty the make-up day.
+    """
+    indexed: list[tuple[int, dict[str, Any]]] = []
+    for index, event in enumerate(events, start=1):
+        for occurrence in _expand_event_occurrences(event, start_bound, end_bound):
+            if occurrence["_start"].date().isoformat() in overrides:
+                continue
+            indexed.append((index, occurrence))
+
+    source_cache: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for day_text, rule in overrides.items():
+        if rule["kind"] != DAY_OVERRIDE_SHIFT:
+            continue
+        target_day = _parse_day_text(day_text)
+        source_day = _parse_day_text(rule["source_day"])
+        if target_day is None or source_day is None:
+            continue
+        target_start = datetime.combine(target_day, time.min, tzinfo=LOCAL_TZ)
+        target_end = target_start + timedelta(days=1)
+        if target_start >= end_bound or target_end <= start_bound:
+            continue
+        source_start = datetime.combine(source_day, time.min, tzinfo=LOCAL_TZ)
+        cached = source_cache.get(rule["source_day"])
+        if cached is None:
+            cached = _expand_events_on_day(events, source_day)
+            source_cache[rule["source_day"]] = cached
+        for index, occurrence in cached:
+            start = target_start + (occurrence["_start"] - source_start)
+            shifted = dict(occurrence)
+            shifted["_start"] = start
+            shifted["_end"] = start + (occurrence["_end"] - occurrence["_start"])
+            shifted["_shifted_from"] = source_day.isoformat()
+            indexed.append((index, shifted))
+
+    indexed.sort(key=lambda item: item[1]["_start"])
+    return indexed
+
+
 def _expand_member_occurrences(
     member_info: dict[str, Any], start_bound: datetime, end_bound: datetime
 ) -> list[dict[str, Any]]:
@@ -122,13 +223,13 @@ def _expand_member_occurrences(
     if not isinstance(events, list):
         return []
 
-    occurrences: list[dict[str, Any]] = []
-    for event in events:
-        if isinstance(event, dict):
-            occurrences.extend(_expand_event_occurrences(event, start_bound, end_bound))
-
-    occurrences.sort(key=lambda item: item["_start"])
-    return occurrences
+    indexed = _expand_indexed_occurrences(
+        [event for event in events if isinstance(event, dict)],
+        _member_day_overrides(member_info),
+        start_bound,
+        end_bound,
+    )
+    return [occurrence for _index, occurrence in indexed]
 
 
 def _day_bounds(target_date: date) -> tuple[datetime, datetime]:

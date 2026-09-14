@@ -22,3 +22,22 @@ def _command_tail(event, value: str = "") -> str:
         return ""
     parts = message.strip().split(maxsplit=1)
     return parts[1].strip() if len(parts) == 2 else ""
+
+
+def _full_command_tail(event, value: str = "") -> str:
+    """Return the whole text after the command name, not just the bound word.
+
+    Commands that take several arguments (dates plus a target, for example
+    ``/调休 2026-10-11 2026-10-08 @小明``) need the rest of the message too.
+    The raw tail is used only when it genuinely continues the bound value, so
+    adapters that bind the full remainder or rewrite the text keep working.
+    """
+    bound = _command_tail(event, value)
+    raw = _command_tail(event, "")
+    if (
+        len(raw) > len(bound)
+        and raw.startswith(bound)
+        and raw[len(bound)].isspace()
+    ):
+        return raw
+    return bound

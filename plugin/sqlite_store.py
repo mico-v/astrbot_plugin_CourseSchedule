@@ -6,10 +6,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .constants import PLUGIN_ID
+from .constants import DAY_OVERRIDE_ALL, PLUGIN_ID
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _plugin_data_dir() -> Path:
@@ -95,6 +95,18 @@ class SQLiteScheduleStore:
                     ON course_events(scope_id, dtstart);
                 CREATE INDEX IF NOT EXISTS idx_course_events_member_uid
                     ON course_events(scope_id, user_id, uid);
+                CREATE TABLE IF NOT EXISTS schedule_day_overrides (
+                    scope_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_day TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scope_id, user_id, day)
+                );
+                CREATE INDEX IF NOT EXISTS idx_schedule_day_overrides_scope
+                    ON schedule_day_overrides(scope_id, day);
                 """
             )
             conn.execute(
@@ -106,7 +118,7 @@ class SQLiteScheduleStore:
         clean_info = {
             key: value
             for key, value in info.items()
-            if key not in {"_revision", "events"}
+            if key not in {"_revision", "_day_overrides", "events"}
         }
         raw_events = info.get("events")
         events = (
@@ -182,6 +194,7 @@ class SQLiteScheduleStore:
 
     def _get_scope_members_sync(self, scope_id: str) -> dict[str, Any]:
         members: dict[str, Any] = {}
+        scope_overrides = self._scope_day_overrides_sync(scope_id)
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -211,7 +224,9 @@ class SQLiteScheduleStore:
                 info["_revision"] = int(row["revision"])
                 info["events"] = events_by_user.get(str(row["user_id"]), [])
                 info["event_count"] = len(info["events"])
-                members[str(row["user_id"])] = info
+                members[str(row["user_id"])] = self._attach_day_overrides(
+                    info, str(row["user_id"]), scope_overrides
+                )
         return members
 
     async def get_scope_members(self, scope_id: str) -> dict[str, Any]:
@@ -266,6 +281,143 @@ class SQLiteScheduleStore:
         async with self._lock:
             return self._list_scope_summaries_sync()
 
+    @staticmethod
+    def _merge_day_overrides(
+        scope_overrides: dict[str, dict[str, dict[str, str]]], user_id: str
+    ) -> dict[str, dict[str, str]]:
+        """Member rules win over the scope-wide all-members rules."""
+        merged = dict(scope_overrides.get(DAY_OVERRIDE_ALL) or {})
+        merged.update(scope_overrides.get(str(user_id)) or {})
+        return merged
+
+    @classmethod
+    def _attach_day_overrides(
+        cls,
+        info: dict[str, Any],
+        user_id: str,
+        scope_overrides: dict[str, dict[str, dict[str, str]]],
+    ) -> dict[str, Any]:
+        info["_day_overrides"] = cls._merge_day_overrides(scope_overrides, user_id)
+        return info
+
+    def _scope_day_overrides_sync(
+        self, scope_id: str
+    ) -> dict[str, dict[str, dict[str, str]]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, day, kind, source_day, created_by, created_at
+                FROM schedule_day_overrides WHERE scope_id = ?
+                ORDER BY day, user_id
+                """,
+                (scope_id,),
+            ).fetchall()
+        overrides: dict[str, dict[str, dict[str, str]]] = {}
+        for row in rows:
+            overrides.setdefault(str(row["user_id"]), {})[str(row["day"])] = {
+                "kind": str(row["kind"]),
+                "source_day": str(row["source_day"]),
+                "created_by": str(row["created_by"]),
+                "created_at": str(row["created_at"]),
+            }
+        return overrides
+
+    async def get_scope_day_overrides(
+        self, scope_id: str
+    ) -> dict[str, dict[str, dict[str, str]]]:
+        await self.ensure_initialized()
+        async with self._lock:
+            return self._scope_day_overrides_sync(scope_id)
+
+    def _list_day_overrides_sync(self, scope_id: str) -> list[dict[str, str]]:
+        """Flat marker list for one scope, soonest day first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, day, kind, source_day, created_by, created_at
+                FROM schedule_day_overrides WHERE scope_id = ?
+                ORDER BY day, user_id
+                """,
+                (scope_id,),
+            ).fetchall()
+        return [
+            {
+                "user_id": str(row["user_id"]),
+                "day": str(row["day"]),
+                "kind": str(row["kind"]),
+                "source_day": str(row["source_day"]),
+                "created_by": str(row["created_by"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    async def list_day_overrides(self, scope_id: str) -> list[dict[str, str]]:
+        await self.ensure_initialized()
+        async with self._lock:
+            return self._list_day_overrides_sync(scope_id)
+
+    def _set_day_override_sync(
+        self,
+        scope_id: str,
+        user_id: str,
+        day: str,
+        kind: str,
+        source_day: str = "",
+        created_by: str = "",
+        created_at: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO schedule_day_overrides
+                    (scope_id, user_id, day, kind, source_day, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_id, user_id, day) DO UPDATE SET
+                    kind = excluded.kind,
+                    source_day = excluded.source_day,
+                    created_by = excluded.created_by,
+                    created_at = excluded.created_at
+                """,
+                (scope_id, user_id, day, kind, source_day, created_by, created_at),
+            )
+            conn.commit()
+
+    async def set_day_override(
+        self,
+        scope_id: str,
+        user_id: str,
+        day: str,
+        kind: str,
+        source_day: str = "",
+        created_by: str = "",
+        created_at: str = "",
+    ) -> None:
+        await self.ensure_initialized()
+        async with self._lock:
+            self._set_day_override_sync(
+                scope_id, user_id, day, kind, source_day, created_by, created_at
+            )
+
+    def _delete_day_override_sync(self, scope_id: str, user_id: str, day: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM schedule_day_overrides
+                WHERE scope_id = ? AND user_id = ? AND day = ?
+                """,
+                (scope_id, user_id, day),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    async def delete_day_override(
+        self, scope_id: str, user_id: str, day: str
+    ) -> bool:
+        await self.ensure_initialized()
+        async with self._lock:
+            return self._delete_day_override_sync(scope_id, user_id, day)
+
     def _get_member_sync(self, scope_id: str, user_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -293,7 +445,9 @@ class SQLiteScheduleStore:
         info["_revision"] = int(row["revision"])
         info["events"] = self._decode_event_rows(event_rows)
         info["event_count"] = len(info["events"])
-        return info
+        return self._attach_day_overrides(
+            info, user_id, self._scope_day_overrides_sync(scope_id)
+        )
 
     async def get_member(self, scope_id: str, user_id: str) -> dict[str, Any] | None:
         await self.ensure_initialized()

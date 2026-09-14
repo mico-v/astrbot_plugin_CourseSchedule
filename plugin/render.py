@@ -325,6 +325,7 @@ def _status_colors(status_key: str) -> tuple[str, str, str]:
         "upcoming": ("#2563eb", "#dbeafe", "#60a5fa"),
         "finished": ("#64748b", "#f1f5f9", "#94a3b8"),
         "scheduled": ("#7c3aed", "#ede9fe", "#a78bfa"),
+        "holiday": ("#b45309", "#fef3c7", "#f59e0b"),
         "none": ("#64748b", "#f8fafc", "#cbd5e1"),
         "rank1": ("#b45309", "#fef3c7", "#f59e0b"),
         "rank2": ("#475569", "#e2e8f0", "#94a3b8"),
@@ -497,15 +498,18 @@ def _draw_rows_image(
 
     legend_top = 143
     legend_left = 44
-    legend_items = (
-        (
+    if legend is None:
+        legend_items = [
             ("active", "正在上课"),
             ("upcoming", "下一节即将上"),
             ("finished", "今日已结束"),
-        )
-        if legend is None
-        else legend
-    )
+        ]
+        if any(row.get("status_key") == "holiday" for row in rows):
+            legend_items.append(("holiday", "休假"))
+        if any(row.get("override_note") for row in rows):
+            legend_items.append(("scheduled", "调休上课"))
+    else:
+        legend_items = list(legend)
     for status_key, label in legend_items:
         _foreground, _background, accent = _status_colors(status_key)
         draw.ellipse((legend_left, legend_top + 10, legend_left + 10, legend_top + 20), fill=accent)

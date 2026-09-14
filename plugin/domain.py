@@ -10,8 +10,8 @@ from uuid import uuid4
 
 from icalendar import vRecur
 
-from .constants import LOCAL_TZ
-from .occurrences import _expand_member_occurrences
+from .constants import DAY_OVERRIDE_HOLIDAY, DAY_OVERRIDE_SHIFT, LOCAL_TZ
+from .occurrences import _expand_member_occurrences, _member_day_overrides
 from .ics import _parse_ics_datetime_obj
 
 
@@ -172,11 +172,21 @@ def daily_member_rows(
             continue
         occurrences = _expand_member_occurrences(info, start_bound, end_bound)
         occurrences.sort(key=lambda item: item["_start"])
+        override = _member_day_overrides(info).get(target.isoformat()) or {}
+        holiday = override.get("kind") == DAY_OVERRIDE_HOLIDAY
+        override_source = (
+            str(override.get("source_day") or "")
+            if override.get("kind") == DAY_OVERRIDE_SHIFT
+            else ""
+        )
+        shift_note = ""
+        if override_source:
+            shift_note = f"调休 · 按 {date.fromisoformat(override_source):%m-%d} 的课表"
         active = next(
             (
                 item
                 for item in occurrences
-                if is_today and item["_start"] <= current < item["_end"]
+                if not holiday and is_today and item["_start"] <= current < item["_end"]
             ),
             None,
         )
@@ -184,13 +194,25 @@ def daily_member_rows(
             (
                 item
                 for item in occurrences
-                if (is_today and item["_start"] > current)
-                or (target > current.date())
+                if not holiday
+                and (
+                    (is_today and item["_start"] > current)
+                    or (target > current.date())
+                )
             ),
             None,
         )
 
-        if active:
+        if holiday:
+            state = "holiday"
+            featured = None
+            status = "今日休假" if is_today else "当天休假"
+            countdown_label = "假期状态"
+            countdown = "当天课程全部取消"
+            progress = 0.0
+            sort_time = float("inf")
+            sort_priority = 3
+        elif active:
             state = "active"
             featured = active
             status = "正在上课"
@@ -244,12 +266,20 @@ def daily_member_rows(
             sort_priority = 3
 
         course, location = _daily_row_course(featured)
-        if featured:
+        if holiday:
+            course = "休假 · 无课程安排"
+            location = ""
+            duration_minutes = 0
+            duration = "—"
+            time_text = "当天课程已全部取消"
+        elif featured:
             duration_minutes = max(
                 1, round((featured["_end"] - featured["_start"]).total_seconds() / 60)
             )
             duration = _format_duration_minutes(duration_minutes)
             time_text = f"{featured['_start']:%H:%M} - {featured['_end']:%H:%M}"
+            if shift_note:
+                time_text = f"{shift_note}   ·   {time_text}"
         else:
             duration_minutes = 0
             duration = "—"
@@ -269,7 +299,10 @@ def daily_member_rows(
                 "countdown_label": countdown_label,
                 "countdown": countdown,
                 "progress": progress,
-                "course_count": len(occurrences),
+                "course_count": 0 if holiday else len(occurrences),
+                "override_kind": str(override.get("kind") or ""),
+                "override_source": override_source,
+                "override_note": shift_note,
                 "sort_priority": sort_priority,
                 "sort_time": sort_time,
             }
