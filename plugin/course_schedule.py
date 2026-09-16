@@ -19,7 +19,12 @@ from .constants import (
     MAX_ICS_BYTES,
     MAX_MEMBERS_PER_CREATE,
 )
-from .day_off import day_count_text, format_day_list, split_day_override_args
+from .day_off import (
+    day_count_text,
+    format_day_list,
+    relative_day_text,
+    split_day_override_args,
+)
 from .domain import (
     _display_name,
     _format_duration_minutes,
@@ -43,7 +48,7 @@ from .rank import (
     RANK_MAX_RANGE_DAYS,
     build_rank_rows,
 )
-from .render import _draw_rank_image, _draw_rows_image
+from .render import _draw_rank_image, _draw_rows_image, schedule_footer
 from .sql_query import _parse_sql_time_range
 from .sqlite_store import ScheduleWriteConflict, SQLiteScheduleStore
 from .store import _scope_id
@@ -1430,14 +1435,27 @@ class CourseScheduleBase:
             return None
 
         now = datetime.now(LOCAL_TZ)
-        selected_date = target_date or now.date()
+        today = now.date()
+        selected_date = target_date or today
         rows = daily_member_rows(members, selected_date, now=now)
-        title = f"课程表 · {selected_date:%Y-%m-%d}"
+        weekday = "一二三四五六日"[selected_date.weekday()]
+        title = f"课程表 · {selected_date:%Y-%m-%d} 周{weekday}"
+        # Today keeps the live "x 人正在上课" line; another day has no live
+        # state, so it names the day relative to today instead.
+        subtitle = None
+        if selected_date != today:
+            with_class = sum(1 for row in rows if row.get("course_count"))
+            subtitle = (
+                f"{relative_day_text(selected_date, today)} · "
+                f"共 {len(rows)} 位成员 · {with_class} 人有课"
+            )
         return await asyncio.to_thread(
             _draw_rows_image,
             title,
             rows,
             f"schedule_{selected_date:%Y%m%d}.png",
+            subtitle=subtitle,
+            footer=schedule_footer(selected_date, today),
         )
 
     async def _group_today_image(self, event: AstrMessageEvent) -> str | None:

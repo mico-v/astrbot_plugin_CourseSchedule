@@ -283,7 +283,7 @@ def daily_member_rows(
         else:
             duration_minutes = 0
             duration = "—"
-            time_text = "今天没有安排课程"
+            time_text = "今天没有安排课程" if is_today else "当天没有安排课程"
 
         result.append(
             {

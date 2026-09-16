@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unicodedata
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from urllib.request import urlopen
@@ -435,6 +436,20 @@ def _draw_progress(
         )
 
 
+FOOTER_LIVE = "实时状态 · 课程时间以本地时区为准"
+FOOTER_ARCHIVE = "历史课表 · 课程时间以本地时区为准"
+FOOTER_PLANNED = "课程安排 · 课程时间以本地时区为准"
+
+
+def schedule_footer(selected: date, today: date) -> str:
+    """Footer line for one day view, so a past day is not called "live"."""
+    if selected < today:
+        return FOOTER_ARCHIVE
+    if selected > today:
+        return FOOTER_PLANNED
+    return FOOTER_LIVE
+
+
 def _draw_rows_image(
     title: str,
     rows: list[dict[str, object]],
@@ -443,7 +458,7 @@ def _draw_rows_image(
     subtitle: str | None = None,
     legend: list[tuple[str, str]] | None = None,
     duration_label: str = "本节持续",
-    footer: str = "实时状态 · 课程时间以本地时区为准",
+    footer: str = FOOTER_LIVE,
 ) -> str:
     width = 1240
     header_height = 202

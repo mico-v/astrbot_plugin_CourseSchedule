@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import datetime
 import re
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -10,15 +10,17 @@ from astrbot.api.web import error_response, json_response, request
 from .plugin.constants import (
     DAY_OVERRIDE_HOLIDAY,
     DAY_OVERRIDE_SHIFT,
+    LOCAL_TZ,
     PLUGIN_ID,
 )
 from .plugin.course_schedule import CourseScheduleBase, GroupMemberLookupError
+from .plugin.day_off import single_day_query
 from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
-from .plugin.texts import _command_tail, _full_command_tail
+from .plugin.texts import _full_command_tail
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.11.0")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.12.0")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -138,15 +140,13 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
 
     @filter.command("课表")
     async def schedule(self, event: AstrMessageEvent, query: str = ""):
-        """查询指定日期课程表，例如 /课表 或 /课表 2026-09-01。"""
-        value = _command_tail(event, query)
-        target = None
-        if value:
-            try:
-                target = date.fromisoformat(value)
-            except ValueError:
-                yield event.plain_result("日期格式应为 YYYY-MM-DD，例如：/课表 2026-09-01")
-                return
+        """查询指定日期课程表，例如 /课表、/课表 9.17、/课表 明天、/课表 昨天。"""
+        target, error = single_day_query(
+            _full_command_tail(event, query), datetime.now(LOCAL_TZ).date()
+        )
+        if error:
+            yield event.plain_result(error)
+            return
         path = await self._group_schedule_image(event, target)
         if not path:
             yield event.plain_result("当前会话还没有可展示的课程表。")
@@ -157,7 +157,7 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
     async def rank_board(self, event: AstrMessageEvent, query: str = ""):
         """生成本会话群友上课时长排行榜，例如 /上课时长榜 或 /上课时长榜 本月。"""
         try:
-            path = await self._rank_board_image(event, _command_tail(event, query))
+            path = await self._rank_board_image(event, _full_command_tail(event, query))
         except ValueError as exc:
             yield event.plain_result(str(exc))
             return
