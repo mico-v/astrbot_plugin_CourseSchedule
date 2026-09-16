@@ -12,13 +12,13 @@ from .plugin.constants import (
     DAY_OVERRIDE_SHIFT,
     PLUGIN_ID,
 )
-from .plugin.course_schedule import CourseScheduleBase
+from .plugin.course_schedule import CourseScheduleBase, GroupMemberLookupError
 from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
 from .plugin.texts import _command_tail, _full_command_tail
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.10.0")
+@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.11.0")
 class CourseSchedulePlugin(CourseScheduleBase, Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -39,6 +39,18 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
             self._web_save_schedule,
             ["POST"],
             "Save one member course schedule",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/members",
+            self._web_group_members,
+            ["GET"],
+            "List group members without a saved schedule",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/schedule/create",
+            self._web_create_schedules,
+            ["POST"],
+            "Create empty course schedules for selected group members",
         )
 
     async def _web_scopes(self):
@@ -69,6 +81,42 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         except ValueError as exc:
             return error_response(str(exc), status_code=400)
         return json_response(saved)
+
+    async def _web_group_members(self):
+        scope_id = str(request.query.get("scope_id") or "").strip()
+        try:
+            members = await self._pending_group_members(scope_id)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        except GroupMemberLookupError as exc:
+            return error_response(str(exc), status_code=502)
+        return json_response(
+            {"scope_id": scope_id, "members": members, "member_count": len(members)}
+        )
+
+    async def _web_create_schedules(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。", status_code=400)
+        selections = payload.get("members")
+        if not isinstance(selections, list):
+            return error_response("members 必须是数组。", status_code=400)
+        scope_id = str(payload.get("scope_id") or "").strip()
+        try:
+            created = await self._create_member_schedules(
+                scope_id,
+                selections,
+                actor=str(request.username or "webui"),
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(
+            {
+                "scope_id": scope_id,
+                "created": created,
+                "created_count": len(created),
+            }
+        )
 
     @filter.command("今日课表")
     async def today_schedule(self, event: AstrMessageEvent):

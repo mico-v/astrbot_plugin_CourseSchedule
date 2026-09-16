@@ -78,6 +78,47 @@
       </section>
     </main>
 
+    <div
+      id="addMemberDialog"
+      class="dialog-overlay hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="addMemberTitle"
+    >
+      <div class="dialog-card">
+        <header class="dialog-head">
+          <div>
+            <p class="section-kicker">ADD MEMBERS</p>
+            <h2 id="addMemberTitle">添加成员课表</h2>
+            <p id="addMemberMeta" class="muted"></p>
+          </div>
+          <button id="addMemberClose" class="dialog-close" type="button" aria-label="关闭">×</button>
+        </header>
+
+        <label class="search-box dialog-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="addMemberSearch" type="search" placeholder="搜索昵称或 QQ 号" autocomplete="off" />
+        </label>
+
+        <div class="dialog-toolbar">
+          <button id="addMemberSelectAll" class="button button-ghost" type="button">全选可见</button>
+          <button id="addMemberReload" class="button button-ghost" type="button">重新获取</button>
+          <span id="addMemberCount" class="count-pill" title="已选成员">0</span>
+        </div>
+
+        <div id="addMemberList" class="member-picker"></div>
+        <p id="addMemberEmpty" class="no-courses hidden"></p>
+
+        <footer class="dialog-foot">
+          <p id="addMemberHint" class="muted">为新成员创建空白课表后，即可在右侧编辑课程。</p>
+          <div class="dialog-actions">
+            <button id="addMemberCancel" class="button button-ghost" type="button">取消</button>
+            <button id="addMemberSubmit" class="button button-primary" type="button">添加课表</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
     <template id="courseTemplate">
       <article class="course-card">
         <div class="course-card-head">

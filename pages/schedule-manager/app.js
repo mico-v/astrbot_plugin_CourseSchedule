@@ -8,6 +8,16 @@ const state = {
   dirty: false,
 };
 
+const addMembers = {
+  scopeId: "",
+  label: "",
+  members: [],
+  selected: new Set(),
+  filter: "",
+  loading: false,
+  error: "",
+};
+
 const $ = (selector) => document.querySelector(selector);
 const notice = $("#notice");
 const scopeList = $("#scopeList");
@@ -101,6 +111,24 @@ function renderScopes() {
       if (first) loadMember(scope.scope_id, first.user_id);
     });
 
+    const row = document.createElement("div");
+    row.className = "scope-row";
+    row.append(scopeButton);
+
+    if (scope.kind === "group") {
+      const addButton = document.createElement("button");
+      addButton.type = "button";
+      addButton.className = "scope-add";
+      addButton.title = `为「${scope.label}」添加成员课表`;
+      addButton.setAttribute("aria-label", `为${scope.label}添加成员课表`);
+      addButton.textContent = "＋";
+      addButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openAddMembers(scope);
+      });
+      row.append(addButton);
+    }
+
     const title = document.createElement("div");
     title.className = "scope-item-title";
     title.textContent = scope.label;
@@ -108,7 +136,7 @@ function renderScopes() {
     meta.className = "scope-item-meta";
     meta.textContent = `${scope.member_count || 0} 位成员 · ${scope.event_count || 0} 节课`;
     scopeButton.append(title, meta);
-    section.append(scopeButton);
+    section.append(row);
 
     if (state.selectedScopeId === scope.scope_id) {
       const members = document.createElement("div");
@@ -225,10 +253,12 @@ async function loadMember(scopeId, userId) {
     setDirty(false);
     renderEditor();
     showNotice("");
+    return true;
   } catch (error) {
     state.schedule = null;
     renderEditor();
     showNotice(error.message || "读取课表失败。", "error");
+    return false;
   }
 }
 
@@ -282,6 +312,156 @@ async function saveSchedule() {
   }
 }
 
+function roleLabel(role) {
+  return { owner: "群主", admin: "管理员" }[role] || "";
+}
+
+function visiblePicks() {
+  const query = addMembers.filter.trim().toLocaleLowerCase();
+  if (!query) return addMembers.members;
+  return addMembers.members.filter((member) =>
+    `${member.name || ""} ${member.user_id}`.toLocaleLowerCase().includes(query),
+  );
+}
+
+function makePickRow(member) {
+  const row = document.createElement("label");
+  row.className = `pick-row${addMembers.selected.has(member.user_id) ? " checked" : ""}`;
+
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = addMembers.selected.has(member.user_id);
+  box.addEventListener("change", () => {
+    if (box.checked) addMembers.selected.add(member.user_id);
+    else addMembers.selected.delete(member.user_id);
+    row.classList.toggle("checked", box.checked);
+    renderPickerMeta();
+  });
+
+  const text = document.createElement("div");
+  text.className = "pick-text";
+  const name = document.createElement("span");
+  name.className = "pick-name";
+  name.textContent = member.name || member.user_id;
+  const meta = document.createElement("span");
+  meta.className = "pick-meta";
+  const role = roleLabel(member.role);
+  meta.textContent = `${member.user_id}${role ? ` · ${role}` : ""}`;
+  text.append(name, meta);
+
+  row.append(box, text);
+  return row;
+}
+
+function renderPickerMeta() {
+  $("#addMemberCount").textContent = String(addMembers.selected.size);
+  const submit = $("#addMemberSubmit");
+  submit.disabled = addMembers.loading || addMembers.selected.size === 0;
+  submit.textContent = addMembers.selected.size
+    ? `添加课表（${addMembers.selected.size}）`
+    : "添加课表";
+}
+
+function renderPicker() {
+  const list = $("#addMemberList");
+  const empty = $("#addMemberEmpty");
+  const visible = visiblePicks();
+  list.replaceChildren();
+  for (const member of visible) list.append(makePickRow(member));
+
+  const place = addMembers.label || addMembers.scopeId;
+  let emptyText = "";
+  if (addMembers.loading) {
+    $("#addMemberMeta").textContent = `${place} · 正在读取群成员…`;
+    emptyText = "正在读取群成员…";
+  } else if (addMembers.error) {
+    $("#addMemberMeta").textContent = `${place} · 读取失败`;
+    emptyText = addMembers.error;
+  } else {
+    $("#addMemberMeta").textContent = `${place} · 可添加 ${addMembers.members.length} 位成员`;
+    if (!addMembers.members.length) emptyText = "该群的成员都已经有课表了。";
+    else if (!visible.length) emptyText = "没有匹配的成员。";
+  }
+  empty.textContent = emptyText;
+  empty.classList.toggle("hidden", !emptyText);
+  renderPickerMeta();
+}
+
+function openAddMembers(scope) {
+  addMembers.scopeId = scope.scope_id;
+  addMembers.label = scope.label;
+  addMembers.filter = "";
+  addMembers.members = [];
+  addMembers.selected = new Set();
+  addMembers.error = "";
+  $("#addMemberSearch").value = "";
+  $("#addMemberDialog").classList.remove("hidden");
+  loadAddMembers();
+}
+
+function closeAddMembers() {
+  $("#addMemberDialog").classList.add("hidden");
+  addMembers.scopeId = "";
+  addMembers.label = "";
+  addMembers.members = [];
+  addMembers.selected = new Set();
+  addMembers.error = "";
+  addMembers.loading = false;
+}
+
+async function loadAddMembers() {
+  addMembers.loading = true;
+  addMembers.error = "";
+  addMembers.members = [];
+  addMembers.selected = new Set();
+  renderPicker();
+  try {
+    const data = await bridge.apiGet("members", { scope_id: addMembers.scopeId });
+    addMembers.members = Array.isArray(data?.members) ? data.members : [];
+  } catch (error) {
+    addMembers.error = error.message || "读取群成员失败，请确认机器人已连接。";
+  } finally {
+    addMembers.loading = false;
+  }
+  renderPicker();
+}
+
+function toggleAllVisible() {
+  const visible = visiblePicks();
+  const allSelected = visible.length > 0 && visible.every((member) => addMembers.selected.has(member.user_id));
+  for (const member of visible) {
+    if (allSelected) addMembers.selected.delete(member.user_id);
+    else addMembers.selected.add(member.user_id);
+  }
+  renderPicker();
+}
+
+async function submitAddMembers() {
+  const chosen = addMembers.members.filter((member) => addMembers.selected.has(member.user_id));
+  if (!chosen.length) return;
+  const scopeId = addMembers.scopeId;
+  const button = $("#addMemberSubmit");
+  setBusy(button, true);
+  try {
+    const result = await bridge.apiPost("schedule/create", {
+      scope_id: scopeId,
+      members: chosen.map((member) => ({ user_id: member.user_id, name: member.name })),
+    });
+    closeAddMembers();
+    const created = Array.isArray(result?.created) ? result.created : chosen;
+    await loadScopes();
+    let selected = true;
+    if (created.length) selected = await loadMember(scopeId, created[0].user_id);
+    if (selected) {
+      showNotice(`已为 ${created.length} 位成员创建课表，可以开始编辑课程。`);
+    }
+  } catch (error) {
+    showNotice(error.message || "添加课表失败。", "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function refresh() {
   if (!canLeaveEditor()) return;
   const button = $("#refreshButton");
@@ -310,6 +490,23 @@ async function start() {
     setDirty(true);
   });
   $("#saveButton").addEventListener("click", saveSchedule);
+  $("#addMemberClose").addEventListener("click", closeAddMembers);
+  $("#addMemberCancel").addEventListener("click", closeAddMembers);
+  $("#addMemberReload").addEventListener("click", loadAddMembers);
+  $("#addMemberSubmit").addEventListener("click", submitAddMembers);
+  $("#addMemberSelectAll").addEventListener("click", toggleAllVisible);
+  $("#addMemberSearch").addEventListener("input", (event) => {
+    addMembers.filter = event.target.value;
+    renderPicker();
+  });
+  $("#addMemberDialog").addEventListener("click", (event) => {
+    if (event.target === $("#addMemberDialog")) closeAddMembers();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("#addMemberDialog").classList.contains("hidden")) {
+      closeAddMembers();
+    }
+  });
   await loadScopes({ keepSelection: false });
 }
 

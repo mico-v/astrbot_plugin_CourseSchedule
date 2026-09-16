@@ -17,6 +17,7 @@ from .constants import (
     MAX_DAY_OVERRIDES_PER_SCOPE,
     MAX_EVENTS_PER_FILE,
     MAX_ICS_BYTES,
+    MAX_MEMBERS_PER_CREATE,
 )
 from .day_off import day_count_text, format_day_list, split_day_override_args
 from .domain import (
@@ -48,6 +49,10 @@ from .sqlite_store import ScheduleWriteConflict, SQLiteScheduleStore
 from .store import _scope_id
 from .texts import _is_own_query
 from .time_utils import _now_iso
+
+
+class GroupMemberLookupError(RuntimeError):
+    """Raised when a group's member list cannot be read from the platform."""
 
 
 class CourseScheduleBase:
@@ -254,6 +259,167 @@ class CourseScheduleBase:
             ),
             "event_count": len(events),
         }
+
+    @staticmethod
+    def _protocol_action(client: Any) -> Any:
+        """Return a callable that runs a protocol action on a platform client."""
+        for candidate in (getattr(client, "api", None), client):
+            action = getattr(candidate, "call_action", None)
+            if callable(action):
+                return action
+        return None
+
+    def _group_action_clients(self) -> list[Any]:
+        """Collect clients able to query group members, OneBot adapters first.
+
+        Nothing here is required for the chat commands, so every lookup is
+        best-effort: an adapter without a protocol client is simply skipped.
+        """
+        manager = getattr(getattr(self, "context", None), "platform_manager", None)
+        getter = getattr(manager, "get_insts", None)
+        platforms: list[Any] = []
+        if callable(getter):
+            try:
+                platforms = list(getter() or [])
+            except Exception:
+                platforms = []
+        clients: list[tuple[int, Any]] = []
+        for platform in platforms:
+            try:
+                name = str(getattr(platform.meta(), "name", "") or "")
+            except Exception:
+                name = ""
+            client = None
+            get_client = getattr(platform, "get_client", None)
+            if callable(get_client):
+                try:
+                    client = get_client()
+                except Exception:
+                    client = None
+            if client is None:
+                client = getattr(platform, "bot", None)
+            action = self._protocol_action(client) if client is not None else None
+            if action is not None:
+                clients.append((0 if "cqhttp" in name.lower() else 1, action))
+        clients.sort(key=lambda item: item[0])
+        return [action for _rank, action in clients]
+
+    @staticmethod
+    def _normalize_group_members(result: Any) -> list[dict[str, str]]:
+        rows = result if isinstance(result, list) else None
+        if rows is None and isinstance(result, dict):
+            inner = result.get("data")
+            rows = inner if isinstance(inner, list) else None
+        members: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            user_id = str(row.get("user_id") or "").strip()
+            if not user_id or not user_id.isdigit() or user_id in seen:
+                continue
+            seen.add(user_id)
+            name = _display_name(row.get("card") or row.get("nickname") or "").strip()
+            members.append(
+                {
+                    "user_id": user_id,
+                    "name": name or user_id,
+                    "role": str(row.get("role") or ""),
+                }
+            )
+        return members
+
+    async def _platform_group_members(self, group_id: str) -> list[dict[str, str]]:
+        """Read one group's member list from the connected message platform."""
+        actions = self._group_action_clients()
+        if not actions:
+            raise GroupMemberLookupError(
+                "没有可用的消息平台适配器，无法读取群成员。请确认机器人已连接。"
+            )
+        last_error = ""
+        for action in actions:
+            try:
+                result = await action("get_group_member_list", group_id=int(group_id))
+            except Exception as exc:
+                last_error = str(exc).strip() or exc.__class__.__name__
+                continue
+            members = self._normalize_group_members(result)
+            if members:
+                return members
+            list_length = len(result) if isinstance(result, (list, dict)) else 0
+            last_error = (
+                "群成员里没有可用的 QQ 号，请确认使用的是 QQ 适配器"
+                if list_length
+                else "群成员列表为空"
+            )
+        raise GroupMemberLookupError(
+            "读取群成员失败，请确认机器人已加入该群并且在线。"
+            + (f"（{last_error}）" if last_error else "")
+        )
+
+    @staticmethod
+    def _group_id_from_scope(scope_id: str) -> str:
+        scope = str(scope_id or "").strip()
+        if not scope.startswith("group:"):
+            raise ValueError("只能为群聊添加成员课表。")
+        group_id = scope.split(":", 1)[1].strip()
+        if not group_id.isdigit():
+            raise ValueError("无效的 scope_id。")
+        return group_id
+
+    async def _pending_group_members(self, scope_id: str) -> list[dict[str, str]]:
+        """Group members that do not have a schedule in this scope yet."""
+        group_id = self._group_id_from_scope(scope_id)
+        existing = await self._schedule_store.get_scope_members(scope_id)
+        members = await self._platform_group_members(group_id)
+        return [member for member in members if member["user_id"] not in existing]
+
+    async def _create_member_schedules(
+        self,
+        scope_id: str,
+        selections: list[Any],
+        *,
+        actor: str = "webui",
+    ) -> list[dict[str, str]]:
+        """Create empty schedules so a member can be edited in the WebUI."""
+        self._group_id_from_scope(scope_id)
+        if not selections:
+            raise ValueError("请至少选择一位成员。")
+        if len(selections) > MAX_MEMBERS_PER_CREATE:
+            raise ValueError(f"一次最多添加 {MAX_MEMBERS_PER_CREATE} 位成员。")
+
+        created: list[dict[str, str]] = []
+        for raw in selections:
+            if not isinstance(raw, dict):
+                raise ValueError("成员格式无效。")
+            user_id = str(raw.get("user_id") or "").strip()
+            if not user_id.isdigit():
+                raise ValueError("成员 QQ 号无效。")
+            name = _display_name(raw.get("name") or "").strip() or user_id
+            if len(name) > 200:
+                raise ValueError("成员名称不能超过 200 个字符。")
+            now = _now_iso()
+            info = {
+                "name": name,
+                "events": [],
+                "ics": _serialize_schedule_ics([], ""),
+                "schedule": "",
+                "source": "manual",
+                "updated_at": now,
+                "schedule_updated_at": now,
+                "last_modified_by": str(actor or "webui"),
+            }
+            try:
+                await self._schedule_store.put_member(
+                    scope_id, user_id, info, expected_revision=0
+                )
+            except ScheduleWriteConflict:
+                # Another request created this member first; nothing to do.
+                continue
+            created.append({"user_id": user_id, "name": name})
+        if not created:
+            raise ValueError("所选成员都已经有课表了。")
+        return created
 
     async def _save_ics_schedule(
         self,
