@@ -18,8 +18,8 @@ _EMOJI_FONT_NAMES = (
     "QEmoji.ttf",
     "TwemojiMozilla.ttf",
     "NotoColorEmoji.ttf",
-    "NotoEmoji-Regular.ttf",
     "NotoEmoji-VariableFont_wght.ttf",
+    "NotoEmoji-Regular.ttf",
     "NotoEmoji.ttf",
     "seguiemj.ttf",
     "Apple Color Emoji.ttc",
@@ -67,6 +67,22 @@ def _load_font(
     return ImageFont.load_default()
 
 
+@lru_cache(maxsize=64)
+def _load_emoji_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
+    """Load every installed Emoji font so a cluster can pick the one that
+    actually covers it.  The bundled Noto Emoji predates recent Emoji, so a
+    fuller system font must be allowed to win (for example for U+1F9CA)."""
+    fonts: list[ImageFont.FreeTypeFont] = []
+    for candidate in _emoji_font_candidates():
+        if not candidate or not Path(candidate).exists():
+            continue
+        try:
+            fonts.append(ImageFont.truetype(candidate, size))
+        except OSError:
+            continue
+    return tuple(fonts)
+
+
 def _has_real_font(font: ImageFont.ImageFont) -> bool:
     return isinstance(font, ImageFont.FreeTypeFont) and isinstance(
         getattr(font, "path", None), (str, Path)
@@ -87,6 +103,28 @@ def _font_codepoints(font_path: str, font_number: int) -> frozenset[int] | None:
         return None
 
 
+# A code point guaranteed to be absent from every real font, used to capture
+# the .notdef (tofu) bitmap when fontTools cannot read the cmap.
+_NOTDEF_SENTINEL = "\U0010ffff"
+
+
+def _renders_notdef(font: ImageFont.ImageFont, text: str) -> bool:
+    """Detect the .notdef/tofu glyph by comparing rendered bitmaps.
+
+    ``getbbox`` treats the tofu box as a real box, so it cannot tell a missing
+    glyph from a present one.  Rendering the same text as an unassigned code
+    point and comparing the bitmaps identifies it without fontTools.
+    """
+    if not _has_real_font(font):
+        return False
+    try:
+        probe = font.getmask(text)
+        notdef = font.getmask(_NOTDEF_SENTINEL)
+    except Exception:
+        return False
+    return probe.size == notdef.size and bytes(probe) == bytes(notdef)
+
+
 def _font_supports(font: ImageFont.ImageFont, text: str) -> bool:
     """Check cmap coverage so a missing glyph does not become a tofu box."""
     if not _has_real_font(font):
@@ -94,9 +132,16 @@ def _font_supports(font: ImageFont.ImageFont, text: str) -> bool:
     font_path = str(getattr(font, "path", ""))
     cmap = _font_codepoints(font_path, getattr(font, "index", 0))
     if cmap is None:
-        # If fontTools is not installed, keep the fallback useful for fonts
-        # selected specifically as emoji fonts.
-        return any(_is_emoji_character(character) for character in text)
+        # fontTools is unavailable.  Never claim an Emoji is supported just
+        # because it looks like one: verify per character that FreeType is not
+        # falling back to the .notdef box, otherwise every Emoji would be
+        # drawn with the CJK font as a tofu box.
+        return all(
+            not _renders_notdef(font, character)
+            for character in text
+            if unicodedata.category(character) != "Cf"
+            and not unicodedata.category(character).startswith("M")
+        )
     is_emoji_text = any(_is_emoji_character(character) for character in text)
     return all(
         ord(character) in cmap
@@ -108,6 +153,8 @@ def _font_supports(font: ImageFont.ImageFont, text: str) -> bool:
 
 
 def _font_has_visible_glyph(font: ImageFont.ImageFont, text: str) -> bool:
+    if _renders_notdef(font, text):
+        return False
     try:
         bbox = font.getbbox(text)
     except (AttributeError, ValueError):
@@ -178,11 +225,21 @@ def _font_for_cluster(
         return primary, False
 
     # Keep one consistent primary font for all regular text.  Only a cluster
-    # that the primary font cannot render gets the single configured Emoji
-    # fallback (important for QQ private-use Emoji and ZWJ sequences).
-    emoji_font = _load_font(size, emoji=True)
-    if _font_supports(emoji_font, cluster) and _font_has_visible_glyph(emoji_font, cluster):
-        return emoji_font, True
+    # that the primary font cannot render gets an Emoji fallback (important for
+    # QQ private-use Emoji and ZWJ sequences).  Try every installed Emoji font
+    # and keep the first that really covers this cluster, so an outdated
+    # bundled font does not shadow a fuller system font.
+    emoji_fonts = _load_emoji_fonts(size)
+    for emoji_font in emoji_fonts:
+        if _font_supports(emoji_font, cluster) and _font_has_visible_glyph(
+            emoji_font, cluster
+        ):
+            return emoji_font, True
+
+    # No installed font has the glyph.  A dedicated Emoji font still renders a
+    # better-sized fallback than the CJK primary, so prefer it when available.
+    if emoji_fonts:
+        return emoji_fonts[0], True
     return primary, False
 
 
