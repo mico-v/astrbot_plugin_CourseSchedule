@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -1430,6 +1431,7 @@ class CourseScheduleBase:
     async def _group_schedule_image(
         self, event: AstrMessageEvent, target_date: date | None = None
     ) -> str | None:
+        started_at = time.perf_counter()
         members = await self._get_scope_members(event)
         if not members:
             return None
@@ -1456,6 +1458,7 @@ class CourseScheduleBase:
             f"schedule_{selected_date:%Y%m%d}.png",
             subtitle=subtitle,
             footer=schedule_footer(selected_date, today),
+            started_at=started_at,
         )
 
     async def _group_today_image(self, event: AstrMessageEvent) -> str | None:
@@ -1492,6 +1495,7 @@ class CourseScheduleBase:
     async def _rank_board_image(
         self, event: AstrMessageEvent, period: str = ""
     ) -> str | None:
+        started_at = time.perf_counter()
         rows, label = await self._rank_board_rows(event, period)
         if not rows:
             return None
@@ -1507,4 +1511,5 @@ class CourseScheduleBase:
             subtitle=f"{label}  ·  共 {len(rows)} 位成员  ·  合计 {total_text}",
             footer=footer,
             top_n=DEFAULT_RANK_TOP_N,
+            started_at=started_at,
         )

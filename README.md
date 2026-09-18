@@ -14,9 +14,9 @@ AstrBot 课程表插件，用于保存、查询和展示群友课程表。课程
 - 在 AstrBot WebUI 的插件 Pages 中按群组、成员手动增删改课程，并同步保存到本地 ICS。
 - 在 WebUI 中按群成员批量创建新课表：读取群成员并自动过滤已有课表的成员。
 - 向 AI 暴露聚合的 `find` 查询工具和 `edit` 编辑工具，避免 Agent 在多个重复工具之间选择。
-- 图片渲染统一使用内置 Noto Sans CJK SC 字体绘制中文、英文、数字和普通符号；仅当该字体确实缺少 Emoji 字形时，才回退到内置 Noto Emoji（含系统 Emoji 字体）逐个字符簇兜底。
+- 图片渲染统一使用内置 Noto Sans CJK SC 字体绘制中文、英文、数字和普通符号；仅当该字体确实缺少 Emoji 字形时，才回退到内置 Noto Color Emoji（彩色，含系统 Emoji 字体）逐个字符簇兜底。
 
-今日课表图片按成员分卡片展示：正在上课、下一节即将上课、今日课程已结束和今日无课分别使用不同状态色；当天的当前课程会显示本节时长、距下课/上课倒计时和进度条。昵称中的 Unicode Emoji（包括国旗、肤色和 ZWJ 组合表情）会使用 Emoji 字体单独绘制，避免 CJK 字体缺字。
+今日课表图片按成员分卡片展示：正在上课、下一节即将上课、今日课程已结束和今日无课分别使用不同状态色；当天的当前课程会显示本节时长、距下课/上课倒计时和进度条。昵称中的 Unicode Emoji（包括国旗、肤色和 ZWJ 组合表情）会使用 Emoji 字体单独绘制，优先使用彩色 Emoji 字体，避免 CJK 字体缺字。
 
 上课时长榜按成员在统计区间内的课程占用时长排名，名次前列使用不同的强调色，卡片上同时给出节数、门数、已上时长和相对榜首的时长占比。
 
@@ -30,7 +30,10 @@ AstrBot 课程表插件，用于保存、查询和展示群友课程表。课程
 课程表数据保存于 AstrBot 的插件数据目录：
 
 ```text
-data/plugin_data/astrbot_plugin_course_schedule/course_schedule.sqlite3
+data/plugin_data/astrbot_plugin_course_schedule/
+├── course_schedule.sqlite3   # 课表数据库
+├── avatars/                  # QQ 头像缓存（TTL 1 天）
+└── images/                   # 生成的课表图片（超过 1 天自动清理）
 ```
 
 插件使用 SQLite 按“作用域 + QQ 号”保存成员记录，`VEVENT` 事件独立保存于 `course_events` 表，

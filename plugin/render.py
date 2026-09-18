@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -9,7 +12,7 @@ from urllib.request import urlopen
 from PIL import Image, ImageDraw, ImageFont
 
 from .constants import FONT_DIR
-from .files import _asset_temp_path
+from .files import _plugin_data_dir_path
 
 
 _EMOJI_FONT_NAMES = (
@@ -68,19 +71,67 @@ def _load_font(
 
 
 @lru_cache(maxsize=64)
-def _load_emoji_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
-    """Load every installed Emoji font so a cluster can pick the one that
-    actually covers it.  The bundled Noto Emoji predates recent Emoji, so a
-    fuller system font must be allowed to win (for example for U+1F9CA)."""
-    fonts: list[ImageFont.FreeTypeFont] = []
+def _bitmap_strike_size(font_path: str) -> int | None:
+    """Native pixel size of an embedded-bitmap colour font (CBDT/sbix/EBDT).
+
+    FreeType refuses any other size for bitmap-only fonts, raising
+    ``OSError: invalid pixel size``, so the strike has to be discovered before
+    a colour Emoji font can be used.
+    """
+    try:
+        from fontTools.ttLib import TTFont
+
+        with TTFont(font_path, lazy=True) as loaded:
+            if "CBLC" in loaded:
+                return int(loaded["CBLC"].strikes[0].bitmapSizeTable.ppemY)
+            if "EBLC" in loaded:
+                return int(loaded["EBLC"].strikes[0].bitmapSizeTable.ppemY)
+            if "sbix" in loaded:
+                return int(loaded["sbix"].strikes[0].ppem)
+    except Exception:
+        pass
+    # fontTools unavailable: probe the sizes bitmap Emoji fonts commonly use.
+    for probe in (109, 136, 128, 160, 96, 64):
+        try:
+            ImageFont.truetype(font_path, probe)
+            return probe
+        except OSError:
+            continue
+    return None
+
+
+@lru_cache(maxsize=64)
+def _emoji_font_variants(
+    size: int,
+) -> tuple[tuple[ImageFont.FreeTypeFont, float], ...]:
+    """Load every installed Emoji font as ``(font, scale)``.
+
+    Vector colour fonts (COLR/CPAL) load at the requested size with a scale of
+    1.0.  Bitmap colour fonts (Noto Color Emoji CBDT) only accept their native
+    strike, so they are loaded there and drawn scaled down to ``size``.
+    """
+    variants: list[tuple[ImageFont.FreeTypeFont, float]] = []
+    seen: set[str] = set()
     for candidate in _emoji_font_candidates():
         if not candidate or not Path(candidate).exists():
             continue
+        key = str(Path(candidate).resolve())
+        if key in seen:
+            continue
+        seen.add(key)
         try:
-            fonts.append(ImageFont.truetype(candidate, size))
+            variants.append((ImageFont.truetype(candidate, size), 1.0))
+            continue
+        except OSError:
+            pass
+        strike = _bitmap_strike_size(candidate)
+        if not strike:
+            continue
+        try:
+            variants.append((ImageFont.truetype(candidate, strike), size / strike))
         except OSError:
             continue
-    return tuple(fonts)
+    return tuple(variants)
 
 
 def _has_real_font(font: ImageFont.ImageFont) -> bool:
@@ -121,6 +172,10 @@ def _renders_notdef(font: ImageFont.ImageFont, text: str) -> bool:
         probe = font.getmask(text)
         notdef = font.getmask(_NOTDEF_SENTINEL)
     except Exception:
+        return False
+    if not any(bytes(probe)):
+        # An empty mask is inconclusive: COLR colour-layer glyphs and bitmap
+        # fonts both report no monochrome coverage.  Do not call those tofu.
         return False
     return probe.size == notdef.size and bytes(probe) == bytes(notdef)
 
@@ -214,40 +269,50 @@ def _graphemes(text: str) -> list[str]:
     return clusters
 
 
+@lru_cache(maxsize=16384)
 def _font_for_cluster(
     cluster: str, size: int, bold: bool
-) -> tuple[ImageFont.ImageFont, bool]:
+) -> tuple[ImageFont.ImageFont, bool, float]:
+    """Return ``(font, is_emoji, scale)`` for one grapheme cluster.
+
+    ``scale`` is 1.0 for outline fonts and < 1.0 when the glyph comes from a
+    bitmap Emoji font rendered at its native strike and downscaled.
+    """
     primary = _load_font(size, bold=bold)
     if not _is_emoji_cluster(cluster):
-        return primary, False
+        return primary, False, 1.0
 
     if _font_supports(primary, cluster) and _font_has_visible_glyph(primary, cluster):
-        return primary, False
+        return primary, False, 1.0
 
     # Keep one consistent primary font for all regular text.  Only a cluster
     # that the primary font cannot render gets an Emoji fallback (important for
     # QQ private-use Emoji and ZWJ sequences).  Try every installed Emoji font
     # and keep the first that really covers this cluster, so an outdated
     # bundled font does not shadow a fuller system font.
-    emoji_fonts = _load_emoji_fonts(size)
-    for emoji_font in emoji_fonts:
+    variants = _emoji_font_variants(size)
+    for emoji_font, scale in variants:
         if _font_supports(emoji_font, cluster) and _font_has_visible_glyph(
             emoji_font, cluster
         ):
-            return emoji_font, True
+            return emoji_font, True, scale
 
     # No installed font has the glyph.  A dedicated Emoji font still renders a
     # better-sized fallback than the CJK primary, so prefer it when available.
-    if emoji_fonts:
-        return emoji_fonts[0], True
-    return primary, False
+    if variants:
+        emoji_font, scale = variants[0]
+        return emoji_font, True, scale
+    return primary, False, 1.0
+
+
+@lru_cache(maxsize=16384)
+def _cluster_advance(cluster: str, size: int, bold: bool) -> float:
+    font, _is_emoji, scale = _font_for_cluster(cluster, size, bold)
+    return font.getlength(cluster) * scale
 
 
 def _rich_width(text: str, size: int, bold: bool = False) -> float:
-    return sum(
-        _font_for_cluster(cluster, size, bold)[0].getlength(cluster)
-        for cluster in _graphemes(text)
-    )
+    return sum(_cluster_advance(cluster, size, bold) for cluster in _graphemes(text))
 
 
 def _fit_rich_text(text: str, size: int, max_width: int, bold: bool = False) -> str:
@@ -296,6 +361,49 @@ def _baseline_for_top(font: ImageFont.ImageFont, top: float) -> float:
     return top - bbox[1]
 
 
+def _draw_scaled_emoji(
+    image: Image.Image | None,
+    x: float,
+    baseline: float,
+    cluster: str,
+    font: ImageFont.FreeTypeFont,
+    scale: float,
+    fill: str,
+) -> bool:
+    """Draw a bitmap-strike Emoji glyph downscaled to the target size.
+
+    FreeType only accepts the native strike size for CBDT/sbix fonts, so the
+    glyph is rendered colour at that size and then resized.  Returns ``False``
+    when no image is available or the glyph renders empty so the caller can
+    fall back to a normal draw.
+    """
+    native = int(round(getattr(font, "size", 0) or 0))
+    if image is None or native <= 0 or scale <= 0:
+        return False
+    pad = 4
+    width = max(1, int(font.getlength(cluster)) + pad * 2)
+    canvas = Image.new("RGBA", (width, native * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(canvas).text(
+        (pad, native),
+        cluster,
+        font=font,
+        fill=fill,
+        anchor="ls",
+        embedded_color=True,
+    )
+    box = canvas.getbbox()
+    if box is None:
+        return False
+    scaled = canvas.crop(box).resize(
+        (max(1, round((box[2] - box[0]) * scale)), max(1, round((box[3] - box[1]) * scale))),
+        Image.LANCZOS,
+    )
+    paste_x = int(round(x + (box[0] - pad) * scale))
+    paste_y = int(round(baseline + (box[1] - native) * scale))
+    image.paste(scaled, (paste_x, paste_y), scaled)
+    return True
+
+
 def _draw_rich_text(
     draw: ImageDraw.ImageDraw,
     xy: tuple[float, float],
@@ -309,8 +417,14 @@ def _draw_rich_text(
     value = _fit_rich_text(text, size, max_width, bold) if max_width else str(text or "")
     x, y = xy
     baseline = _baseline_for_top(_load_font(size, bold=bold), y)
+    image = getattr(draw, "_image", None)
     for cluster in _graphemes(value):
-        font, is_emoji = _font_for_cluster(cluster, size, bold)
+        font, is_emoji, scale = _font_for_cluster(cluster, size, bold)
+        if is_emoji and scale != 1.0 and _draw_scaled_emoji(
+            image, x, baseline, cluster, font, scale, fill
+        ):
+            x += font.getlength(cluster) * scale
+            continue
         try:
             draw.text(
                 (x, baseline),
@@ -324,7 +438,7 @@ def _draw_rich_text(
             # Pillow versions before embedded_color still render monochrome
             # emoji fonts, which is preferable to dropping the nickname glyph.
             draw.text((x, baseline), cluster, font=font, fill=fill, anchor="ls")
-        x += font.getlength(cluster)
+        x += font.getlength(cluster) * scale
     return x
 
 
@@ -356,25 +470,139 @@ def _ellipsis(text: str, font: ImageFont.ImageFont, max_width: int) -> str:
     return text + suffix if text else suffix
 
 
-@lru_cache(maxsize=256)
-def _fetch_avatar(user_id: str, size: int) -> Image.Image:
+def _circle_avatar(avatar: Image.Image, size: int) -> Image.Image:
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    rounded = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    rounded.paste(avatar, (0, 0), mask)
+    return rounded
+
+
+def _download_avatar(user_id: str, size: int) -> Image.Image | None:
     url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=100"
     try:
         with urlopen(url, timeout=5) as response:
             avatar = Image.open(response).convert("RGB").resize((size, size))
     except Exception:
-        avatar = Image.new("RGB", (size, size), "#dbe4f0")
-        fallback_draw = ImageDraw.Draw(avatar)
-        font = _load_font(22, bold=True)
-        label = user_id[-2:] if user_id else "?"
-        fallback_draw.text((size / 2, size / 2), label, fill="#40516b", font=font, anchor="mm")
+        return None
+    return _circle_avatar(avatar, size)
 
-    mask = Image.new("L", (size, size), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.ellipse((0, 0, size - 1, size - 1), fill=255)
-    rounded = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    rounded.paste(avatar, (0, 0), mask)
-    return rounded
+
+def _fallback_avatar(user_id: str, size: int) -> Image.Image:
+    avatar = Image.new("RGB", (size, size), "#dbe4f0")
+    font = _load_font(22, bold=True)
+    label = user_id[-2:] if user_id else "?"
+    ImageDraw.Draw(avatar).text(
+        (size / 2, size / 2), label, fill="#40516b", font=font, anchor="mm"
+    )
+    return _circle_avatar(avatar, size)
+
+
+def _read_avatar_cache(path: Path) -> Image.Image | None:
+    """Return the cached avatar when it is younger than the TTL."""
+    try:
+        stats = path.stat()
+    except OSError:
+        return None
+    if time.time() - stats.st_mtime > AVATAR_CACHE_TTL_SECONDS:
+        return None
+    try:
+        with Image.open(path) as cached:
+            return cached.convert("RGBA")
+    except Exception:
+        return None
+
+
+def _write_avatar_cache(path: Path, avatar: Image.Image) -> None:
+    """Persist an avatar atomically so a killed process cannot leave a partial file."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        avatar.save(tmp, format="PNG")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+@lru_cache(maxsize=512)
+def _fetch_avatar(user_id: str, size: int) -> Image.Image:
+    """Fetch one avatar, preferring a disk cache that expires after one day."""
+    cache_path = _avatar_cache_path(user_id, size)
+    cached = _read_avatar_cache(cache_path)
+    if cached is not None:
+        return cached
+    avatar = _download_avatar(user_id, size)
+    if avatar is not None:
+        _write_avatar_cache(cache_path, avatar)
+        return avatar
+    return _fallback_avatar(user_id, size)
+
+
+# Avatar downloads are network bound and were fetched one by one, so a group
+# of N members paid N sequential round trips (and N timeouts when qlogo is
+# unreachable).  Fetch them concurrently first; _fetch_avatar is cached, so the
+# per-row calls during drawing become cache hits.
+AVATAR_SIZE = 76
+_AVATAR_WORKERS = 8
+AVATAR_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+# Output format: JPEG keeps the encoder fast (several times quicker than PNG on
+# these mostly-flat cards) at a comparable payload size.  4:2:0 subsampling is
+# fine for this content and keeps the file small.
+IMAGE_EXTENSION = ".jpg"
+IMAGE_JPEG_QUALITY = 85
+IMAGE_JPEG_SUBSAMPLING = 2
+
+# Generated cards are only needed until the platform has fetched them, so old
+# files in the output directory are pruned instead of growing forever.
+OUTPUT_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+@lru_cache(maxsize=1)
+def _avatar_cache_dir() -> Path:
+    return _plugin_data_dir_path("avatars")
+
+
+def _avatar_cache_path(user_id: str, size: int) -> Path:
+    safe = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in user_id
+    )[:64]
+    return _avatar_cache_dir() / f"{safe or 'unknown'}_{size}.png"
+
+
+def _prune_old_outputs(directory: Path) -> None:
+    now = time.time()
+    try:
+        for item in directory.iterdir():
+            if item.is_file() and now - item.stat().st_mtime > OUTPUT_MAX_AGE_SECONDS:
+                item.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _save_output_image(image: Image.Image, filename: str) -> str:
+    """Save the rendered card and return its path in the configured format."""
+    directory = _plugin_data_dir_path("images")
+    _prune_old_outputs(directory)
+    path = directory / Path(filename).with_suffix(IMAGE_EXTENSION).name
+    image.convert("RGB").save(
+        path,
+        format="JPEG",
+        quality=IMAGE_JPEG_QUALITY,
+        subsampling=IMAGE_JPEG_SUBSAMPLING,
+    )
+    return str(path)
+
+
+def _prefetch_avatars(user_ids: list[object], size: int) -> None:
+    unique = [uid for uid in dict.fromkeys(str(uid or "") for uid in user_ids) if uid]
+    if len(unique) <= 1:
+        return
+    workers = min(_AVATAR_WORKERS, len(unique))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda uid: _fetch_avatar(uid, size), unique))
 
 
 def _status_colors(status_key: str) -> tuple[str, str, str]:
@@ -435,6 +663,7 @@ def _draw_rank_image(
     subtitle: str,
     footer: str,
     top_n: int = 0,
+    started_at: float | None = None,
 ) -> str:
     """Render a class-hours leaderboard on the shared member-card layout."""
     shown = rows[:top_n] if top_n and len(rows) > top_n else rows
@@ -449,6 +678,7 @@ def _draw_rank_image(
         ],
         duration_label="",
         footer=footer,
+        started_at=started_at,
     )
 
 
@@ -516,6 +746,7 @@ def _draw_rows_image(
     legend: list[tuple[str, str]] | None = None,
     duration_label: str = "本节持续",
     footer: str = FOOTER_LIVE,
+    started_at: float | None = None,
 ) -> str:
     width = 1240
     header_height = 202
@@ -592,6 +823,8 @@ def _draw_rows_image(
         draw.rounded_rectangle((36, header_height, width - 36, header_height + 140), radius=22, fill="#ffffff")
         draw.text((width / 2, header_height + 70), "暂无成员课程数据", fill="#64748b", font=body_font, anchor="mm")
 
+    _prefetch_avatars([row.get("user_id") for row in rows], AVATAR_SIZE)
+
     for index, row in enumerate(rows):
         top = header_height + sum(card_heights[:index]) + index * card_gap
         card_height = card_heights[index]
@@ -603,7 +836,7 @@ def _draw_rows_image(
         draw.rounded_rectangle((left, top, right, top + card_height), radius=22, fill=card_fill)
         draw.rounded_rectangle((left, top, left + 8, top + card_height), radius=4, fill=accent)
 
-        avatar = _fetch_avatar(str(row.get("user_id") or ""), 76)
+        avatar = _fetch_avatar(str(row.get("user_id") or ""), AVATAR_SIZE)
         image.paste(avatar, (62, top + 40), avatar)
         _draw_wrapped_rich_text(
             draw,
@@ -658,6 +891,9 @@ def _draw_rows_image(
         )
 
     footer_top = header_height + (cards_height if rows else 140)
+    if started_at is not None:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        footer = f"{footer}  ·  生成耗时 {elapsed_ms:.0f} ms"
     draw.text(
         (width / 2, footer_top + 22),
         footer,
@@ -666,6 +902,4 @@ def _draw_rows_image(
         anchor="mm",
     )
 
-    path = _asset_temp_path(filename)
-    image.save(path)
-    return path
+    return _save_output_image(image, filename)

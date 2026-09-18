@@ -6,26 +6,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .constants import DAY_OVERRIDE_ALL, PLUGIN_ID
+from .constants import DAY_OVERRIDE_ALL
+from .files import _plugin_data_dir
 
 
 SCHEMA_VERSION = 2
-
-
-def _plugin_data_dir() -> Path:
-    """Return AstrBot's persistent plugin-data directory."""
-    try:
-        from astrbot.api.star import StarTools
-
-        return Path(StarTools.get_data_dir(PLUGIN_ID))
-    except Exception:
-        # Fallback keeps development/test environments usable and follows the
-        # documented AstrBot layout.
-        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-
-        path = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_ID
-        path.mkdir(parents=True, exist_ok=True)
-        return path
 
 
 class ScheduleWriteConflict(RuntimeError):
