@@ -727,6 +727,85 @@ def _status_colors(status_key: str) -> tuple[str, str, str]:
     return _STATUS_COLORS.get(status_key, _DEFAULT_STATUS_COLORS)
 
 
+# The folded-up strip for members with nothing left today: small avatars in a
+# grid, several per row, so an idle group costs a few lines instead of a card
+# each.
+FOLDED_AVATAR_SIZE = 40
+_FOLDED_CELL_WIDTH = 214
+_FOLDED_NAME_WIDTH = 150
+_FOLDED_ROW_HEIGHT = 62
+_FOLDED_PAD_X = 30
+_FOLDED_PAD_Y = 22
+_FOLDED_TITLE_HEIGHT = 40
+
+
+def _folded_columns(inner_width: int) -> int:
+    return max(1, inner_width // _FOLDED_CELL_WIDTH)
+
+
+def _folded_height(count: int, inner_width: int) -> int:
+    """Height of the folded strip, or 0 when there is nothing to fold."""
+    if count <= 0:
+        return 0
+    columns = _folded_columns(inner_width)
+    rows = (count + columns - 1) // columns
+    return _FOLDED_PAD_Y * 2 + _FOLDED_TITLE_HEIGHT + rows * _FOLDED_ROW_HEIGHT
+
+
+def _draw_folded_members(
+    image: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    rows: list[dict[str, object]],
+    left: int,
+    top: int,
+    inner_width: int,
+    *,
+    title: str = "今天已经没有课的群友",
+    card_fill: str = "#ffffff",
+) -> int:
+    """Draw idle members as compact avatar + nickname cells; returns the height.
+
+    The title counts the members instead of repeating a status per cell, which
+    is what keeps the section to one line of text per row of avatars.
+    """
+    if not rows:
+        return 0
+    height = _folded_height(len(rows), inner_width)
+    right = left + inner_width
+    draw.rounded_rectangle((left, top, right, top + height), radius=22, fill=card_fill)
+    draw.rounded_rectangle((left, top, left + 8, top + height), radius=4, fill="#cbd5e1")
+
+    _draw_rich_text(
+        draw,
+        (left + _FOLDED_PAD_X, top + _FOLDED_PAD_Y),
+        f"{title} · {len(rows)} 人",
+        19,
+        "#475569",
+        bold=True,
+    )
+
+    columns = _folded_columns(inner_width)
+    grid_top = top + _FOLDED_PAD_Y + _FOLDED_TITLE_HEIGHT
+    _prefetch_avatars([row.get("user_id") for row in rows], FOLDED_AVATAR_SIZE)
+    for index, row in enumerate(rows):
+        column = index % columns
+        line = index // columns
+        cell_left = left + _FOLDED_PAD_X + column * _FOLDED_CELL_WIDTH
+        cell_top = grid_top + line * _FOLDED_ROW_HEIGHT
+        avatar = _fetch_avatar(str(row.get("user_id") or ""), FOLDED_AVATAR_SIZE)
+        image.paste(avatar, (cell_left, cell_top), avatar)
+        name = str(row.get("name") or row.get("user_id") or "未知成员")
+        _draw_rich_text(
+            draw,
+            (cell_left + FOLDED_AVATAR_SIZE + 12, cell_top + 11),
+            name,
+            19,
+            "#64748b",
+            max_width=_FOLDED_NAME_WIDTH,
+        )
+    return height
+
+
 def _rank_status_key(rank: int) -> str:
     if rank <= 0:
         return "none"
@@ -854,6 +933,8 @@ def _draw_rows_image(
     *,
     subtitle: str | None = None,
     legend: list[tuple[str, str]] | None = None,
+    folded: list[dict[str, object]] | None = None,
+    folded_title: str = "今天已经没有课的群友",
     duration_label: str = "本节持续",
     footer: str = FOOTER_LIVE,
     started_at: float | None = None,
@@ -864,6 +945,8 @@ def _draw_rows_image(
     footer_height = 54
     name_width = 235
     name_line_height = 30
+    card_left = 36
+    card_inner_width = width - card_left * 2
     # The wrapped name is measured once and reused for both the card height and
     # the drawing pass, so the two can never disagree about a line break.
     name_line_groups = [
@@ -878,10 +961,15 @@ def _draw_rows_image(
     ]
     card_offsets = [0, *accumulate(card_heights)]
     cards_height = card_offsets[-1] + card_gap * max(len(rows) - 1, 0)
+    folded = list(folded or [])
+    # The gap separates the strip from the cards, so it only applies when both
+    # are present.
+    folded_gap = card_gap if (rows and folded) else 0
+    folded_height = _folded_height(len(folded), card_inner_width)
     height = max(
         360,
         header_height
-        + (cards_height if rows else 140)
+        + (cards_height + folded_gap + folded_height if rows or folded else 140)
         + footer_height,
     )
     image = Image.new("RGB", (width, height), "#f5f7fc")
@@ -908,8 +996,10 @@ def _draw_rows_image(
         upcoming_count = sum(
             row.get("status_key") in ("upcoming", "scheduled") for row in rows
         )
+        # Folded members are still members, so they count towards the total.
+        total = len(rows) + len(folded)
         subtitle = (
-            f"共 {len(rows)} 位成员  ·  {active_count} 人正在上课  ·  "
+            f"共 {total} 位成员  ·  {active_count} 人正在上课  ·  "
             f"{upcoming_count} 人待上课"
         )
     _draw_rich_text(draw, (44, 92), subtitle, 20, "#dbeafe")
@@ -917,12 +1007,20 @@ def _draw_rows_image(
     legend_top = 143
     legend_left = 44
     if legend is None:
+        # Only explain the colours a card actually shows.  Members who are done
+        # for the day are folded into the strip below, so "今日已结束" would
+        # otherwise be advertised on an image that has no such card.
+        present = {str(row.get("status_key") or "") for row in rows}
         legend_items = [
-            ("active", "正在上课"),
-            ("upcoming", "下一节即将上"),
-            ("finished", "今日已结束"),
+            (status_key, label)
+            for status_key, label in (
+                ("active", "正在上课"),
+                ("upcoming", "下一节即将上"),
+                ("finished", "今日已结束"),
+            )
+            if status_key in present
         ]
-        if any(row.get("status_key") == "holiday" for row in rows):
+        if "holiday" in present:
             legend_items.append(("holiday", "休假"))
         if any(row.get("override_note") for row in rows):
             legend_items.append(("scheduled", "调休上课"))
@@ -934,7 +1032,7 @@ def _draw_rows_image(
         _draw_rich_text(draw, (legend_left + 18, legend_top), label, 17, "#e2e8f0")
         legend_left += int(_rich_width(label, 17)) + 58
 
-    if not rows:
+    if not rows and not folded:
         draw.rounded_rectangle((36, header_height, width - 36, header_height + 140), radius=22, fill="#ffffff")
         draw.text((width / 2, header_height + 70), "暂无成员课程数据", fill="#64748b", font=body_font, anchor="mm")
 
@@ -1007,7 +1105,21 @@ def _draw_rows_image(
             max_width=right - 972 - 24,
         )
 
-    footer_top = header_height + (cards_height if rows else 140)
+    folded_top = header_height + cards_height + folded_gap
+    _draw_folded_members(
+        image,
+        draw,
+        folded,
+        card_left,
+        folded_top,
+        card_inner_width,
+        title=folded_title,
+    )
+
+    if rows or folded:
+        footer_top = folded_top + folded_height
+    else:
+        footer_top = header_height + 140
     if started_at is not None:
         elapsed_ms = (time.perf_counter() - started_at) * 1000
         footer = f"{footer}  ·  生成耗时 {elapsed_ms:.0f} ms"

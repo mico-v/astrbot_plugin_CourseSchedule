@@ -277,6 +277,10 @@ def daily_member_rows(
                 "override_note": shift_note,
                 "sort_priority": sort_priority,
                 "sort_time": sort_time,
+                # Whether this day is still running.  Callers fold a finished
+                # day's idle members into a compact strip; without this flag a
+                # past date would be indistinguishable from today.
+                "is_live_day": is_today,
             }
         )
 
@@ -289,6 +293,33 @@ def daily_member_rows(
             row["user_id"],
         ),
     )
+
+
+# Row states that mean "nothing left to show today".  A member whose classes are
+# all over, who has none at all, or who is on holiday belongs in the folded-up
+# section instead of taking a full card.
+_FOLDED_STATUS_KEYS = frozenset({"finished", "none", "holiday"})
+
+
+def split_folded_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split member rows into the cards to show and the members to fold away.
+
+    Only a live day is folded: once today's classes are over for someone, their
+    full card is replaced by a compact avatar cell below the remaining cards.
+    A future plan keeps one card per member, because there the countdown to the
+    next class is exactly what the reader wants.  Both lists keep the order
+    ``daily_member_rows`` produced, so the folded strip reads as "finished
+    first, then no class".
+    """
+    if not rows or any(row.get("is_live_day") is False for row in rows):
+        return rows, []
+    folded = [row for row in rows if row.get("status_key") in _FOLDED_STATUS_KEYS]
+    if not folded:
+        return rows, []
+    shown = [row for row in rows if row.get("status_key") not in _FOLDED_STATUS_KEYS]
+    return shown, folded
 
 
 def merge_intervals(intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:

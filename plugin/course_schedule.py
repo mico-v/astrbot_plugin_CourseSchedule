@@ -31,6 +31,7 @@ from .domain import (
     _format_duration_minutes,
     daily_member_rows,
     make_event,
+    split_folded_rows,
 )
 from .ics import (
     _format_ics_schedule,
@@ -1470,17 +1471,22 @@ class CourseScheduleBase:
         now = datetime.now(LOCAL_TZ)
         today = now.date()
         selected_date = target_date or today
-        rows = daily_member_rows(members, selected_date, now=now)
+        all_rows = daily_member_rows(members, selected_date, now=now)
+        # Once the day is over, the members with nothing left are folded into a
+        # compact strip under the cards, so the image shows what is still
+        # happening instead of one full card per idle member.
+        rows, folded = split_folded_rows(all_rows)
+        folded_title = "今天已经没有课的群友" if selected_date == today else "当天已经没有课的群友"
         weekday = "一二三四五六日"[selected_date.weekday()]
         title = f"课程表 · {selected_date:%Y-%m-%d} 周{weekday}"
         # Today keeps the live "x 人正在上课" line; another day has no live
         # state, so it names the day relative to today instead.
         subtitle = None
         if selected_date != today:
-            with_class = sum(1 for row in rows if row.get("course_count"))
+            with_class = sum(1 for row in all_rows if row.get("course_count"))
             subtitle = (
                 f"{relative_day_text(selected_date, today)} · "
-                f"共 {len(rows)} 位成员 · {with_class} 人有课"
+                f"共 {len(all_rows)} 位成员 · {with_class} 人有课"
             )
         return await asyncio.to_thread(
             _draw_rows_image,
@@ -1488,6 +1494,8 @@ class CourseScheduleBase:
             rows,
             f"schedule_{selected_date:%Y%m%d}.png",
             subtitle=subtitle,
+            folded=folded,
+            folded_title=folded_title,
             footer=schedule_footer(selected_date, today),
             started_at=started_at,
         )
