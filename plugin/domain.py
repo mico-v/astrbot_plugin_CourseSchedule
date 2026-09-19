@@ -277,10 +277,6 @@ def daily_member_rows(
                 "override_note": shift_note,
                 "sort_priority": sort_priority,
                 "sort_time": sort_time,
-                # Whether this day is still running.  Callers fold a finished
-                # day's idle members into a compact strip; without this flag a
-                # past date would be indistinguishable from today.
-                "is_live_day": is_today,
             }
         )
 
@@ -295,9 +291,10 @@ def daily_member_rows(
     )
 
 
-# Row states that mean "nothing left to show today".  A member whose classes are
-# all over, who has none at all, or who is on holiday belongs in the folded-up
-# section instead of taking a full card.
+# A member is folded whenever the day holds no class left for them: none at
+# all, on holiday, or already finished.  This is a property of the member's day,
+# not of the date being viewed, so it applies to today, tomorrow and any other
+# day alike.
 _FOLDED_STATUS_KEYS = frozenset({"finished", "none", "holiday"})
 
 
@@ -306,19 +303,20 @@ def split_folded_rows(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split member rows into the cards to show and the members to fold away.
 
-    Only a live day is folded: once today's classes are over for someone, their
-    full card is replaced by a compact avatar cell below the remaining cards.
-    A future plan keeps one card per member, because there the countdown to the
-    next class is exactly what the reader wants.  Both lists keep the order
-    ``daily_member_rows`` produced, so the folded strip reads as "finished
-    first, then no class".
+    Anyone with nothing left on the day — no class, on holiday, or all classes
+    over — becomes a compact avatar cell below the cards instead of taking a
+    full card of their own.  The cards therefore show who still has something
+    coming, and the strip shows who is free.  Both lists keep the order
+    ``daily_member_rows`` produced, so the strip reads as "finished first, then
+    no class".
     """
-    if not rows or any(row.get("is_live_day") is False for row in rows):
+    if not rows:
         return rows, []
-    folded = [row for row in rows if row.get("status_key") in _FOLDED_STATUS_KEYS]
-    if not folded:
-        return rows, []
-    shown = [row for row in rows if row.get("status_key") not in _FOLDED_STATUS_KEYS]
+    shown: list[dict[str, Any]] = []
+    folded: list[dict[str, Any]] = []
+    for row in rows:
+        key = row.get("status_key")
+        (folded if key in _FOLDED_STATUS_KEYS else shown).append(row)
     return shown, folded
 
 

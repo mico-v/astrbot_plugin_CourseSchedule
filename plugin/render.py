@@ -934,7 +934,7 @@ def _draw_rows_image(
     subtitle: str | None = None,
     legend: list[tuple[str, str]] | None = None,
     folded: list[dict[str, object]] | None = None,
-    folded_title: str = "今天已经没有课的群友",
+    folded_title: str = "没有课的群友",
     duration_label: str = "本节持续",
     footer: str = FOOTER_LIVE,
     started_at: float | None = None,

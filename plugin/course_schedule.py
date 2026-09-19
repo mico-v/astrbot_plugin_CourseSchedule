@@ -1472,11 +1472,18 @@ class CourseScheduleBase:
         today = now.date()
         selected_date = target_date or today
         all_rows = daily_member_rows(members, selected_date, now=now)
-        # Once the day is over, the members with nothing left are folded into a
-        # compact strip under the cards, so the image shows what is still
-        # happening instead of one full card per idle member.
+        # Members with no class left on the day — none at all, on holiday, or
+        # already finished — become a compact strip under the cards instead of
+        # one full card each.  This holds for any date, so the cards always show
+        # who still has something coming.
         rows, folded = split_folded_rows(all_rows)
-        folded_title = "今天已经没有课的群友" if selected_date == today else "当天已经没有课的群友"
+        # The strip is named for the day being shown, since it now appears for
+        # any date rather than only for today.
+        folded_title = (
+            "今天已经没有课的群友"
+            if selected_date == today
+            else f"{selected_date:%m-%d} 没有课的群友"
+        )
         weekday = "一二三四五六日"[selected_date.weekday()]
         title = f"课程表 · {selected_date:%Y-%m-%d} 周{weekday}"
         # Today keeps the live "x 人正在上课" line; another day has no live
