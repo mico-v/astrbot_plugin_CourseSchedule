@@ -38,6 +38,7 @@ data/plugin_data/astrbot_plugin_course_schedule/
 
 插件使用 SQLite 按“作用域 + QQ 号”保存成员记录，`VEVENT` 事件独立保存于 `course_events` 表，
 休假/调休标记保存于 `schedule_day_overrides` 表；写入使用事务和 revision 乐观锁。
+头像只用于卡片展示，按 QQ 号缓存 1 天后重新抓取，超时或抓取失败时用昵称首字兜底并短暂缓存。
 
 ## ICS 导入
 
@@ -45,6 +46,10 @@ data/plugin_data/astrbot_plugin_course_schedule/
 `event.get_messages()` 消息链读取 `File` 消息段，并调用 `await File.get_file()` 获取本地文件；
 独立的 `.ics` 文件消息也会交给自动导入处理器。
 导入成功后会在当前会话作用域内按发送者 QQ 号写入 SQLite，并保留原始 ICS 内容。
+
+按群文件约定命名的 `schedule<QQ号>.ics` 会写入该 QQ 号对应的成员课表，因此
+**为其他成员导入需要管理员权限**，和 `edit`、`/休假` 的规则一致；普通成员只能导入自己的课表，
+私聊也只能导入自己的。文件不带该命名时，导入对象是发送者本人。
 插件不会调用 OneBot 群文件上传、下载或删除 API。
 
 ## 聊天命令

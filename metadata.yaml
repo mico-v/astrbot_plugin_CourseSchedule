@@ -2,6 +2,13 @@ name: astrbot_plugin_course_schedule
 display_name: 课程表
 desc: 使用标准 iCalendar 和 SQLite 保存、解析、查询并展示群友课程表，支持休假与调休标记。
 version: v0.12.0
-author: CourseSchedule
-repo: ""
+author: mico-v
+repo: https://github.com/mico-v/astrbot_plugin_CourseSchedule
 short_desc: 标准 ICS 解析，文件消息自动导入，AI 用 find 查询和 edit 增删改本地课表，支持休假/调休。
+# get_group_member_list, used by the WebUI "batch create schedules" flow, is a
+# OneBot v11 extension API, so the aiocqhttp adapter is the supported one.
+support_platforms:
+  - aiocqhttp
+# astrbot.api.web (register_web_api, request/json_response), StarTools.get_data_dir
+# and the plugin Pages bridge are all needed, so the plugin requires 4.17 or newer.
+astrbot_version: ">=4.17,<5"
