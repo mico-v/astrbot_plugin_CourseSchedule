@@ -50,15 +50,32 @@ from .rank import (
     build_rank_rows,
 )
 from .render import _draw_rank_image, _draw_rows_image, schedule_footer
-from .sql_query import _parse_sql_time_range
 from .sqlite_store import ScheduleWriteConflict, SQLiteScheduleStore
 from .store import _scope_id
 from .texts import _is_own_query
+from .time_range import _parse_time_range
 from .time_utils import _now_iso
 
 
 class GroupMemberLookupError(RuntimeError):
     """Raised when a group's member list cannot be read from the platform."""
+
+
+# `field=status` accepts the canonical past/current/future names plus the
+# Chinese words the reply text itself uses, so a value can be copied straight
+# out of a previous find result.
+_STATUS_ALIASES = {
+    "正在上课": "current",
+    "当前": "current",
+    "进行中": "current",
+    "ongoing": "current",
+    "未来": "future",
+    "将要上课": "future",
+    "未开始": "future",
+    "已结束": "past",
+    "过去": "past",
+    "finished": "past",
+}
 
 
 class CourseScheduleBase:
@@ -162,7 +179,7 @@ class CourseScheduleBase:
         user_id = str(payload.get("user_id") or "").strip()
         if not scope_id or not user_id:
             raise ValueError("scope_id 和 user_id 不能为空。")
-        if not (scope_id.startswith("group:") or scope_id.startswith("private:")):
+        if not scope_id.startswith(("group:", "private:")):
             raise ValueError("无效的 scope_id。")
         try:
             expected_revision = int(payload.get("revision"))
@@ -433,15 +450,25 @@ class CourseScheduleBase:
         ics_content: str,
         *,
         user_id: str | None = None,
-        name: str | None = None,
         source_file: str = "",
-        uploader_id: str | None = None,
     ) -> str:
         """Parse and persist one ICS document.
 
-        This is the import boundary reserved for the future "file reference +
-        @bot" message handler. It does not fetch, upload, or delete group files.
+        ``user_id`` overrides the target member when the file name follows the
+        group convention ``schedule<QQ号>.ics``.  Importing for another member
+        is an edit of their schedule, so it needs the same admin rights the
+        edit tool requires.  This never fetches, uploads or deletes group files.
         """
+        sender_id = str(event.get_sender_id())
+        target_id = str(user_id or sender_id)
+        if target_id != sender_id:
+            if not str(event.get_group_id() or "").strip():
+                return "私聊只能导入自己的课表。"
+            if not self._event_is_admin(event):
+                return (
+                    "只能在群里导入自己的课表；为其他成员导入需要管理员权限。"
+                )
+
         content = str(ics_content or "").strip()
         if not content:
             return "ICS 内容为空，未保存。"
@@ -455,18 +482,25 @@ class CourseScheduleBase:
         if not events:
             return "ICS 中没有 VEVENT，未保存。"
 
-        target_id = str(user_id or event.get_sender_id())
         scope = _scope_id(event)
         previous = await self._schedule_store.get_member(scope, target_id) or {}
         now = _now_iso()
+        # Only the owner's own message may name the row after the sender; for
+        # another member the stored name, an @ mention or the QQ number is used
+        # so the uploader's nickname is never written onto someone else.
+        imported_name = (
+            event.get_sender_name()
+            if target_id == sender_id
+            else self._agent_mention_name(event, target_id)
+        )
         info = {
-            "name": name or previous.get("name") or event.get_sender_name() or target_id,
+            "name": previous.get("name") or imported_name or target_id,
             "schedule": schedule_text,
             "updated_at": now,
             "schedule_updated_at": now,
             "source": "ics",
             "source_file": source_file,
-            "uploader_id": uploader_id or event.get_sender_id(),
+            "uploader_id": sender_id,
             "event_count": len(events),
             "events": events,
             "ics": content,
@@ -639,26 +673,31 @@ class CourseScheduleBase:
         if not raw or raw.lower() in {"all", "全部", "所有", "任意", "*"}:
             return None
 
-        # The established date-range parser handles relative dates and Chinese
-        # ranges.  Keep it as the common path so find and the legacy SQL helper
+        # The established range parser handles relative dates and Chinese
+        # ranges.  Keep it as the common path so find and the rank board
         # interpret today/本周/日期范围 identically.
+        day_error: ValueError | None = None
         try:
-            return _parse_sql_time_range(raw, now.date())
-        except ValueError as date_error:
-            pass
+            return _parse_time_range(raw, now.date())
+        except ValueError as exc:
+            day_error = exc
 
-        range_parts = [
+        # Not a day range: accept a full date-time range such as
+        # 2026-09-01 08:00..2026-09-01 10:00, which the day parser cannot read.
+        parts = [
             part.strip()
-            for part in re.split(r"\s*(?:\.\.|~|至|到|—|\bto\b)\s*", raw, maxsplit=1, flags=re.IGNORECASE)
+            for part in re.split(
+                r"\s*(?:\.\.|~|至|到|—|\bto\b)\s*", raw, maxsplit=1, flags=re.IGNORECASE
+            )
             if part.strip()
         ]
         try:
-            if len(range_parts) == 1:
-                start = datetime.fromisoformat(range_parts[0].replace("Z", "+00:00"))
+            if len(parts) == 1:
+                start = datetime.fromisoformat(parts[0].replace("Z", "+00:00"))
                 end = start + timedelta(minutes=1)
-            elif len(range_parts) == 2:
-                start = datetime.fromisoformat(range_parts[0].replace("Z", "+00:00"))
-                end = datetime.fromisoformat(range_parts[1].replace("Z", "+00:00"))
+            elif len(parts) == 2:
+                start = datetime.fromisoformat(parts[0].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(parts[1].replace("Z", "+00:00"))
             else:
                 raise ValueError
             if start.tzinfo is None:
@@ -669,13 +708,12 @@ class CourseScheduleBase:
             end = end.astimezone(LOCAL_TZ)
             if end <= start:
                 raise ValueError("时间范围的结束时间必须晚于开始时间。")
-            label = f"{start:%Y-%m-%d %H:%M}..{end:%Y-%m-%d %H:%M}"
-            return start, end, label
         except ValueError as exc:
             raise ValueError(
                 "无法解析 time_range，请使用 today、YYYY-MM-DD 或 "
                 "YYYY-MM-DD..YYYY-MM-DD，也可以使用完整日期时间范围。"
-            ) from (date_error if "date_error" in locals() else exc)
+            ) from (day_error or exc)
+        return start, end, f"{start:%Y-%m-%d %H:%M}..{end:%Y-%m-%d %H:%M}"
 
     @staticmethod
     def _agent_status(start: datetime, end: datetime, now: datetime) -> str:
@@ -831,7 +869,7 @@ class CourseScheduleBase:
             if not parsed_range and field_name == "date":
                 try:
                     date.fromisoformat(raw_value)
-                except ValueError as exc:
+                except ValueError:
                     return "date value 应使用 YYYY-MM-DD 格式；日期范围请使用 time_range。"
                 parsed_range = self._agent_time_range(raw_value, now)
         except ValueError as exc:
@@ -842,10 +880,21 @@ class CourseScheduleBase:
         if parsed_range:
             start_bound, end_bound, range_label = parsed_range
 
+        # Validate every typed filter value once, before the rows are built, so
+        # a bad value reports its own error even when nothing matches.
         normalized_value = self._agent_text(raw_value).casefold()
         weekday_value = self._agent_weekday(raw_value) if field_name == "weekday" else None
         if field_name == "weekday" and weekday_value is None:
             return "weekday value 应为周一到周日，例如 周一、1 或 Monday。"
+        duration_value = 0
+        if field_name == "duration":
+            try:
+                duration_value = int(raw_value)
+            except ValueError:
+                return "duration value 应为分钟数，例如 90。"
+        status_value = ""
+        if field_name == "status":
+            status_value = _STATUS_ALIASES.get(normalized_value, normalized_value)
 
         member_summaries: list[str] = []
         rows: list[dict[str, Any]] = []
@@ -918,31 +967,14 @@ class CourseScheduleBase:
                             continue
                     if field_name == "user_id" and str(user_id) != raw_value:
                         continue
-                    if field_name == "status" and status != raw_value.lower():
-                        status_alias = {
-                            "正在上课": "current",
-                            "当前": "current",
-                            "进行中": "current",
-                            "ongoing": "current",
-                            "未来": "future",
-                            "将要上课": "future",
-                            "未开始": "future",
-                            "已结束": "past",
-                            "过去": "past",
-                            "finished": "past",
-                        }
-                        if status_alias.get(raw_value.lower()) != status:
-                            continue
+                    if field_name == "status" and status != status_value:
+                        continue
                     if field_name == "date" and row["date"] != raw_value:
                         continue
                     if field_name == "weekday" and row["weekday"] != weekday_value:
                         continue
-                    if field_name == "duration":
-                        try:
-                            if row["duration"] != int(raw_value):
-                                continue
-                        except ValueError:
-                            return "duration value 应为分钟数，例如 90。"
+                    if field_name == "duration" and row["duration"] != duration_value:
+                        continue
                     if field_name == "start_time" and f"{start:%Y-%m-%d %H:%M}" != raw_value:
                         continue
                     if field_name == "end_time" and f"{end:%Y-%m-%d %H:%M}" != raw_value:
@@ -1005,7 +1037,6 @@ class CourseScheduleBase:
         if not operation:
             return "action 只能是 create/add、update/edit 或 delete/remove（也可使用新增、修改、删除）。"
 
-        scope = _scope_id(event)
         members = await self._get_scope_members(event)
         sender_id = str(event.get_sender_id())
         target_ids, member_error = self._agent_member_ids(
@@ -1482,7 +1513,7 @@ class CourseScheduleBase:
         now = datetime.now(LOCAL_TZ)
         raw = str(period or "").strip() or DEFAULT_RANK_PERIOD
         try:
-            start_bound, end_bound, label = _parse_sql_time_range(raw, now.date())
+            start_bound, end_bound, label = _parse_time_range(raw, now.date())
         except ValueError as exc:
             raise ValueError(
                 "无法识别统计范围，请使用 今日、本周、上周、本月、下月，"

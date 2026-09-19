@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -16,10 +17,8 @@ def _event_datetimes(event: dict[str, str]) -> tuple[datetime | None, datetime |
     if start and not end:
         duration = None
         if event.get("RAW_ICAL"):
-            try:
+            with suppress(Exception):
                 duration = Event.from_ical(event["RAW_ICAL"]).decoded("DURATION")
-            except Exception:
-                pass
         if not isinstance(duration, timedelta):
             duration = (
                 timedelta(days=1)
@@ -95,15 +94,16 @@ def _expand_event_occurrences(
     excluded = set(_recurrence_dates(event, "EXDATE"))
 
     occurrences: list[dict[str, Any]] = []
-    for occurrence_start in occurrence_starts:
-        if occurrence_start.tzinfo is None:
-            occurrence_start = occurrence_start.replace(tzinfo=LOCAL_TZ)
-        occurrence_start = occurrence_start.astimezone(LOCAL_TZ)
-        if occurrence_start in excluded:
+    for candidate in occurrence_starts:
+        start = candidate
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=LOCAL_TZ)
+        start = start.astimezone(LOCAL_TZ)
+        if start in excluded:
             continue
-        occurrence_end = occurrence_start + duration
-        if occurrence_start < end_bound and occurrence_end > start_bound:
-            occurrences.append(_copy_occurrence(event, occurrence_start, occurrence_end))
+        occurrence_end = start + duration
+        if start < end_bound and occurrence_end > start_bound:
+            occurrences.append(_copy_occurrence(event, start, occurrence_end))
 
     occurrences.sort(key=lambda item: item["_start"])
     deduplicated: list[dict[str, Any]] = []
@@ -160,9 +160,11 @@ def _expand_events_on_day(
     day_end = day_start + timedelta(days=1)
     found: list[tuple[int, dict[str, Any]]] = []
     for index, event in enumerate(events, start=1):
-        for occurrence in _expand_event_occurrences(event, day_start, day_end):
-            if occurrence["_start"].date() == day:
-                found.append((index, occurrence))
+        found.extend(
+            (index, occurrence)
+            for occurrence in _expand_event_occurrences(event, day_start, day_end)
+            if occurrence["_start"].date() == day
+        )
     return found
 
 
@@ -230,13 +232,3 @@ def _expand_member_occurrences(
         end_bound,
     )
     return [occurrence for _index, occurrence in indexed]
-
-
-def _day_bounds(target_date: date) -> tuple[datetime, datetime]:
-    start = datetime.combine(target_date, time.min, tzinfo=LOCAL_TZ)
-    return start, start + timedelta(days=1)
-
-
-def _duration_hours(occurrences: list[dict[str, Any]]) -> float:
-    seconds = sum((item["_end"] - item["_start"]).total_seconds() for item in occurrences)
-    return seconds / 3600

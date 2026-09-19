@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import date, datetime, timezone
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -83,10 +84,8 @@ def _parse_ics_datetime_obj(value: str, tzid: str | None = None) -> datetime | N
     if parsed.tzinfo is None:
         zone = LOCAL_TZ
         if tzid:
-            try:
+            with suppress(Exception):
                 zone = ZoneInfo(tzid)
-            except Exception:
-                pass
         parsed = parsed.replace(tzinfo=zone)
     return parsed.astimezone(LOCAL_TZ)
 

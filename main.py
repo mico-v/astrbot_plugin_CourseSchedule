@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import datetime
 import re
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 
 from .plugin.constants import (
@@ -20,8 +21,23 @@ from .plugin.sqlite_store import ScheduleWriteConflict
 from .plugin.texts import _full_command_tail
 
 
-@register(PLUGIN_ID, "CourseSchedule", "保存并查询群友课程表", "0.12.0")
+def _ics_filename_target(filename: str) -> str | None:
+    """Return the QQ号 in the group-file convention ``schedule<QQ号>.ics``.
+
+    Files named that way belong to the member whose number they carry, so
+    referencing one updates that member's row instead of the uploader's.
+    """
+    match = re.fullmatch(r"schedule(\d+)\.ics", str(filename or "").strip(), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 class CourseSchedulePlugin(CourseScheduleBase, Star):
+    """保存并查询群友课程表。
+
+    AstrBot registers any Star subclass automatically; the plugin's name,
+    version and description all come from metadata.yaml.
+    """
+
     def __init__(self, context: Context):
         super().__init__(context)
         context.register_web_api(
@@ -217,20 +233,15 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
             )
             return
         content, filename = extracted
-        try:
-            setattr(event, "_course_schedule_ics_imported", True)
-        except Exception:
-            pass
-        # Preserve the established group-file convention: schedule<QQ>.ics
-        # updates that member's row even when another user references the file.
-        match = re.fullmatch(r"schedule(\d+)\.ics", filename.strip(), re.IGNORECASE)
-        target_user_id = match.group(1) if match else None
+        with suppress(Exception):
+            # Both this handler and the generic message handler can be reached
+            # for one message; the mark keeps the import single-shot.
+            event._course_schedule_ics_imported = True
         result = await self._save_ics_schedule(
             event,
             content,
-            user_id=target_user_id,
+            user_id=_ics_filename_target(filename),
             source_file=filename,
-            uploader_id=event.get_sender_id(),
         )
         yield event.plain_result(result)
 
@@ -258,14 +269,11 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         if not extracted:
             return
         content, filename = extracted
-        match = re.fullmatch(r"schedule(\d+)\.ics", filename.strip(), re.IGNORECASE)
-        target_user_id = match.group(1) if match else None
         result = await self._save_ics_schedule(
             event,
             content,
-            user_id=target_user_id,
+            user_id=_ics_filename_target(filename),
             source_file=filename,
-            uploader_id=event.get_sender_id(),
         )
         yield event.plain_result(result)
 

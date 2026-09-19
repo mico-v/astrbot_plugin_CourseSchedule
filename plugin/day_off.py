@@ -213,8 +213,8 @@ def split_day_override_args(
     """
     days: list[date] = []
     rest: list[str] = []
-    for token in _TOKEN_SPLIT_RE.split(_RANGE_JOIN_RE.sub(r"\1", str(value or ""))):
-        token = token.strip()
+    for raw_token in _TOKEN_SPLIT_RE.split(_RANGE_JOIN_RE.sub(r"\1", str(value or ""))):
+        token = raw_token.strip()
         if not token or token in FILLER_TOKENS:
             continue
         ranged = _range_days(token, today, roll=roll)

@@ -307,13 +307,6 @@ class SQLiteScheduleStore:
             }
         return overrides
 
-    async def get_scope_day_overrides(
-        self, scope_id: str
-    ) -> dict[str, dict[str, dict[str, str]]]:
-        await self.ensure_initialized()
-        async with self._lock:
-            return self._scope_day_overrides_sync(scope_id)
-
     def _list_day_overrides_sync(self, scope_id: str) -> list[dict[str, str]]:
         """Flat marker list for one scope, soonest day first."""
         with self._connect() as conn:
@@ -503,65 +496,3 @@ class SQLiteScheduleStore:
         await self.ensure_initialized()
         async with self._lock:
             self._put_member_sync(scope_id, user_id, info, expected_revision)
-
-    def _patch_member_sync(
-        self, scope_id: str, user_id: str, changes: dict[str, Any]
-    ) -> bool:
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                """
-                SELECT data_json FROM schedule_members
-                WHERE scope_id = ? AND user_id = ?
-                """,
-                (scope_id, user_id),
-            ).fetchone()
-            if not row:
-                conn.rollback()
-                return False
-            try:
-                info = json.loads(row["data_json"])
-            except (TypeError, json.JSONDecodeError):
-                info = {}
-            if not isinstance(info, dict):
-                info = {}
-            info.update(changes)
-            events_changed = "events" in changes
-            if events_changed:
-                payload, events = self._serialize_member(info)
-            else:
-                payload = json.dumps(info, ensure_ascii=False, separators=(",", ":"))
-                events = []
-            conn.execute(
-                """
-                UPDATE schedule_members
-                SET data_json = ?, updated_at = ?, revision = revision + 1
-                WHERE scope_id = ? AND user_id = ?
-                """,
-                (payload, str(info.get("updated_at") or ""), scope_id, user_id),
-            )
-            if events_changed:
-                self._replace_events(conn, scope_id, user_id, events)
-            conn.commit()
-            return True
-
-    async def patch_member(
-        self, scope_id: str, user_id: str, changes: dict[str, Any]
-    ) -> bool:
-        await self.ensure_initialized()
-        async with self._lock:
-            return self._patch_member_sync(scope_id, user_id, changes)
-
-    def _delete_member_sync(self, scope_id: str, user_id: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM schedule_members WHERE scope_id = ? AND user_id = ?",
-                (scope_id, user_id),
-            )
-            conn.commit()
-            return cursor.rowcount == 1
-
-    async def delete_member(self, scope_id: str, user_id: str) -> bool:
-        await self.ensure_initialized()
-        async with self._lock:
-            return self._delete_member_sync(scope_id, user_id)
