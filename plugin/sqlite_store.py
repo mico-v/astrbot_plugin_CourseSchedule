@@ -396,6 +396,78 @@ class SQLiteScheduleStore:
         async with self._lock:
             return self._delete_day_override_sync(scope_id, user_id, day)
 
+    def _replace_day_overrides_sync(
+        self,
+        scope_id: str,
+        user_ids: set[str],
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Make the markers of ``user_ids`` match ``rows`` exactly.
+
+        Markers belonging to other members are left alone, so restoring a
+        backup only rewrites the members the backup actually contains.  The
+        whole rewrite is one transaction: a restore either lands completely or
+        not at all.
+        """
+        wanted = {
+            (str(row.get("user_id") or ""), str(row.get("day") or ""))
+            for row in rows
+        }
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT user_id, day FROM schedule_day_overrides WHERE scope_id = ?
+                """,
+                (scope_id,),
+            ).fetchall()
+            for row in existing:
+                user_id = str(row["user_id"])
+                day = str(row["day"])
+                if user_id not in user_ids or (user_id, day) in wanted:
+                    continue
+                conn.execute(
+                    """
+                    DELETE FROM schedule_day_overrides
+                    WHERE scope_id = ? AND user_id = ? AND day = ?
+                    """,
+                    (scope_id, user_id, day),
+                )
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO schedule_day_overrides
+                        (scope_id, user_id, day, kind, source_day, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scope_id, user_id, day) DO UPDATE SET
+                        kind = excluded.kind,
+                        source_day = excluded.source_day,
+                        created_by = excluded.created_by,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        scope_id,
+                        str(row.get("user_id") or ""),
+                        str(row.get("day") or ""),
+                        str(row.get("kind") or ""),
+                        str(row.get("source_day") or ""),
+                        str(row.get("created_by") or ""),
+                        str(row.get("created_at") or ""),
+                    ),
+                )
+            conn.commit()
+        return len(rows)
+
+    async def replace_day_overrides(
+        self,
+        scope_id: str,
+        user_ids: set[str],
+        rows: list[dict[str, Any]],
+    ) -> int:
+        await self.ensure_initialized()
+        async with self._lock:
+            return self._replace_day_overrides_sync(scope_id, user_ids, rows)
+
     def _get_member_sync(self, scope_id: str, user_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(

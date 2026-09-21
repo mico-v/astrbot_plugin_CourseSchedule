@@ -211,7 +211,7 @@ def _event_component(event: dict[str, str]) -> Event:
 
 
 def _serialize_schedule_ics(
-    events: list[dict[str, str]], base_ics: str = ""
+    events: list[dict[str, str]], base_ics: str = "", calendar_name: str = ""
 ) -> str:
     if base_ics:
         try:
@@ -231,6 +231,11 @@ def _serialize_schedule_ics(
         calendar.add("VERSION", "2.0")
     if "CALSCALE" not in calendar:
         calendar.add("CALSCALE", "GREGORIAN")
+    if calendar_name:
+        # X-WR-CALNAME is what Google Calendar, Apple Calendar and friends show
+        # as the name of the imported calendar, so an exported file is labelled
+        # with the member it belongs to.
+        calendar["X-WR-CALNAME"] = calendar_name
     for event in events:
         calendar.add_component(_event_component(event))
     return calendar.to_ical().decode("utf-8")

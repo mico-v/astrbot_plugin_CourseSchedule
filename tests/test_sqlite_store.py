@@ -101,6 +101,53 @@ class SQLiteScheduleStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summaries[1]["event_count"], 1)
         self.assertEqual(summaries[1]["members"][0]["name"], "李四")
 
+    async def test_replace_day_overrides_rewrites_only_given_members(self) -> None:
+        """A backup restore replaces the markers it carries and keeps the rest."""
+        store = SQLiteScheduleStore(db_path=self.db_path)
+        await store.set_day_override(
+            "group:1", "*", "2026-10-01", "holiday", created_by="10"
+        )
+        await store.set_day_override(
+            "group:1", "10", "2026-10-11", "shift", source_day="2026-10-08"
+        )
+        await store.set_day_override("group:1", "20", "2026-12-25", "holiday")
+        await store.set_day_override("group:2", "10", "2026-10-11", "holiday")
+
+        count = await store.replace_day_overrides(
+            "group:1",
+            {"*", "10"},
+            [
+                {
+                    "user_id": "10",
+                    "day": "2026-10-12",
+                    "kind": "holiday",
+                    "source_day": "",
+                    "created_by": "10",
+                    "created_at": "2026-09-21T00:00:00+00:00",
+                }
+            ],
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            [
+                (row["user_id"], row["day"], row["kind"])
+                for row in await store.list_day_overrides("group:1")
+            ],
+            [("10", "2026-10-12", "holiday"), ("20", "2026-12-25", "holiday")],
+        )
+        # Another scope is never touched.
+        self.assertEqual(len(await store.list_day_overrides("group:2")), 1)
+
+    async def test_replace_day_overrides_can_clear_every_marker(self) -> None:
+        store = SQLiteScheduleStore(db_path=self.db_path)
+        await store.set_day_override("group:1", "*", "2026-10-01", "holiday")
+        await store.set_day_override("group:1", "10", "2026-10-11", "holiday")
+
+        await store.replace_day_overrides("group:1", {"*", "10"}, [])
+
+        self.assertEqual(await store.list_day_overrides("group:1"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,13 @@ const addMembers = {
   error: "",
 };
 
+const transfer = {
+  scopeId: "",
+  label: "",
+  memberCount: 0,
+  file: null,
+};
+
 const $ = (selector) => document.querySelector(selector);
 const notice = $("#notice");
 const scopeList = $("#scopeList");
@@ -114,6 +121,18 @@ function renderScopes() {
     const row = document.createElement("div");
     row.className = "scope-row";
     row.append(scopeButton);
+
+    const transferButton = document.createElement("button");
+    transferButton.type = "button";
+    transferButton.className = "scope-add";
+    transferButton.title = `导入 / 导出「${scope.label}」`;
+    transferButton.setAttribute("aria-label", `导入或导出${scope.label}`);
+    transferButton.textContent = "⇅";
+    transferButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openTransfer(scope);
+    });
+    row.append(transferButton);
 
     if (scope.kind === "group") {
       const addButton = document.createElement("button");
@@ -473,6 +492,157 @@ async function refresh() {
   }
 }
 
+/* ---------------------------------------------------------------- 导入导出 */
+
+function timestamp() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`,
+    `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`,
+  ].join("-");
+}
+
+function safeFileLabel(label) {
+  return String(label || "会话").replace(/[\\/:*?"<>|]+/g, "-").trim() || "会话";
+}
+
+function formatSize(bytes) {
+  const size = Number(bytes) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function canExport() {
+  return (
+    !state.dirty ||
+    window.confirm("当前课表有未保存的修改，导出的内容是已保存的版本。确定继续吗？")
+  );
+}
+
+async function downloadExport(endpoint, params, filename) {
+  showNotice(`正在导出 ${filename}…`);
+  try {
+    await bridge.download(endpoint, params, filename);
+    showNotice(`已开始下载 ${filename}。`);
+    return true;
+  } catch (error) {
+    showNotice(error.message || "导出失败，请刷新页面后重试。", "error");
+    return false;
+  }
+}
+
+async function exportMemberIcs() {
+  if (!state.schedule || !canExport()) return;
+  const { scope_id: scopeId, user_id: userId } = state.schedule;
+  await downloadExport(
+    "schedule/export",
+    { scope_id: scopeId, user_id: userId },
+    `schedule${userId}.ics`,
+  );
+}
+
+async function exportScopeArchive(format) {
+  if (!transfer.scopeId || !canExport()) return;
+  const scope = state.scopes.find((item) => item.scope_id === transfer.scopeId);
+  const label = safeFileLabel(scope?.label || transfer.label);
+  const suffix = format === "backup" ? "原始备份" : "ICS";
+  await downloadExport(
+    "schedule/export",
+    { scope_id: transfer.scopeId, format },
+    `课表-${suffix}-${label}-${timestamp()}.zip`,
+  );
+}
+
+function importSummary(result) {
+  const summary = result || {};
+  const parts = [
+    `已导入 ${summary.member_count || 0} 位成员的课表（新增 ${summary.created_count || 0}、` +
+      `覆盖 ${summary.updated_count || 0}），共 ${summary.event_count || 0} 节课程。`,
+  ];
+  if (summary.day_override_count) {
+    parts.push(`同时恢复 ${summary.day_override_count} 条休假/调休标记。`);
+  }
+  const skipped = Array.isArray(summary.skipped) ? summary.skipped : [];
+  if (skipped.length) {
+    const shown = skipped.slice(0, 3).join("、");
+    parts.push(`忽略 ${skipped.length} 个文件：${shown}${skipped.length > 3 ? "…" : ""}`);
+  }
+  return parts.join("");
+}
+
+function selectedMemberName(scopeId) {
+  if (state.selectedScopeId !== scopeId || !state.selectedUserId) return "";
+  const scope = state.scopes.find((item) => item.scope_id === scopeId);
+  const member = scope?.members?.find((item) => item.user_id === state.selectedUserId);
+  return member ? `${member.name || member.user_id}（${member.user_id}）` : "";
+}
+
+function renderTransfer() {
+  $("#transferMeta").textContent = `${transfer.label} · ${transfer.memberCount} 位成员`;
+  $("#transferScopeCount").textContent = String(transfer.memberCount);
+  $("#transferExportIcs").disabled = transfer.memberCount === 0;
+  $("#transferExportBackup").disabled = transfer.memberCount === 0;
+  $("#transferFileName").textContent = transfer.file
+    ? `${transfer.file.name} · ${formatSize(transfer.file.size)}`
+    : "未选择 .zip 或 .ics 文件";
+  $("#transferImport").disabled = !transfer.file;
+
+  const member = selectedMemberName(transfer.scopeId);
+  $("#transferHint").textContent = member
+    ? `单个 .ics 会导入到当前选中的 ${member}；文件名为 schedule<QQ号>.ics 时以文件名为准。`
+    : "本会话还没有选中成员：导入单个 .ics 前请先选中成员，或把文件命名为 schedule<QQ号>.ics。";
+}
+
+function openTransfer(scope) {
+  transfer.scopeId = scope.scope_id;
+  transfer.label = scope.label;
+  transfer.memberCount = scope.member_count || 0;
+  transfer.file = null;
+  $("#transferFile").value = "";
+  $("#transferDialog").classList.remove("hidden");
+  renderTransfer();
+}
+
+function closeTransfer() {
+  $("#transferDialog").classList.add("hidden");
+  transfer.scopeId = "";
+  transfer.label = "";
+  transfer.memberCount = 0;
+  transfer.file = null;
+  $("#transferFile").value = "";
+}
+
+async function importArchive() {
+  const file = transfer.file;
+  if (!file || !transfer.scopeId) return;
+  if (!canLeaveEditor()) return;
+  const scopeId = transfer.scopeId;
+  const button = $("#transferImport");
+  setBusy(button, true);
+  showNotice("正在导入…");
+  try {
+    // A .zip carries its own member list, so it goes up as a file; a single
+    // .ics is text and names its target in the body.
+    const result = file.name.toLocaleLowerCase().endsWith(".ics")
+      ? await bridge.apiPost("schedule/import", {
+          scope_id: scopeId,
+          user_id: selectedMemberName(scopeId) ? state.selectedUserId : "",
+          filename: file.name,
+          content: await file.text(),
+        })
+      : await bridge.upload(`import/${scopeId}`, file);
+    closeTransfer();
+    await loadScopes();
+    showNotice(importSummary(result));
+  } catch (error) {
+    showNotice(error.message || "导入失败，请检查文件后重试。", "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function start() {
   const context = await bridge.ready();
   document.title = bridge.t("pages.schedule-manager.title", context?.pageTitle || "课表管理");
@@ -502,10 +672,22 @@ async function start() {
   $("#addMemberDialog").addEventListener("click", (event) => {
     if (event.target === $("#addMemberDialog")) closeAddMembers();
   });
+  $("#exportMemberButton").addEventListener("click", exportMemberIcs);
+  $("#transferClose").addEventListener("click", closeTransfer);
+  $("#transferExportIcs").addEventListener("click", () => exportScopeArchive("ics"));
+  $("#transferExportBackup").addEventListener("click", () => exportScopeArchive("backup"));
+  $("#transferImport").addEventListener("click", importArchive);
+  $("#transferFile").addEventListener("change", (event) => {
+    transfer.file = event.target.files?.[0] || null;
+    renderTransfer();
+  });
+  $("#transferDialog").addEventListener("click", (event) => {
+    if (event.target === $("#transferDialog")) closeTransfer();
+  });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !$("#addMemberDialog").classList.contains("hidden")) {
-      closeAddMembers();
-    }
+    if (event.key !== "Escape") return;
+    if (!$("#addMemberDialog").classList.contains("hidden")) closeAddMembers();
+    else if (!$("#transferDialog").classList.contains("hidden")) closeTransfer();
   });
   await loadScopes({ keepSelection: false });
 }

@@ -11,6 +11,13 @@ MAX_EVENTS_PER_FILE = 120
 MAX_MEMBERS_PER_CREATE = 200
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
+# Limits for the WebUI import/export archives: the uploaded zip itself, the
+# bytes it may unpack to (a small zip can expand a lot) and how many files it
+# may contain.
+MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_UNPACKED_BYTES = 32 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 500
+
 # Day-off (休假) and make-up (调休) markers.
 DAY_OVERRIDE_HOLIDAY = "holiday"
 DAY_OVERRIDE_SHIFT = "shift"

@@ -1,34 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 from datetime import datetime
-import re
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.api.web import error_response, json_response, request
+from astrbot.api.web import error_response, file_response, json_response, request
 
+from .plugin.backup import _member_id_from_filename
 from .plugin.constants import (
     DAY_OVERRIDE_HOLIDAY,
     DAY_OVERRIDE_SHIFT,
     LOCAL_TZ,
+    MAX_ARCHIVE_BYTES,
     PLUGIN_ID,
 )
 from .plugin.course_schedule import CourseScheduleBase, GroupMemberLookupError
 from .plugin.day_off import single_day_query
+from .plugin.files import _write_export_file
 from .plugin.message_files import extract_ics_from_event
 from .plugin.sqlite_store import ScheduleWriteConflict
 from .plugin.texts import _full_command_tail
-
-
-def _ics_filename_target(filename: str) -> str | None:
-    """Return the QQ号 in the group-file convention ``schedule<QQ号>.ics``.
-
-    Files named that way belong to the member whose number they carry, so
-    referencing one updates that member's row instead of the uploader's.
-    """
-    match = re.fullmatch(r"schedule(\d+)\.ics", str(filename or "").strip(), re.IGNORECASE)
-    return match.group(1) if match else None
 
 
 class CourseSchedulePlugin(CourseScheduleBase, Star):
@@ -69,6 +62,24 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
             self._web_create_schedules,
             ["POST"],
             "Create empty course schedules for selected group members",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/schedule/export",
+            self._web_export_schedule,
+            ["GET"],
+            "Download one member as .ics or a scope's members as a .zip",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/schedule/import",
+            self._web_import_schedule,
+            ["POST"],
+            "Import one .ics document into one member",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_ID}/import/<scope_id>",
+            self._web_import_archive,
+            ["POST"],
+            "Import an exported .zip (or a lone .ics) into one scope",
         )
 
     async def _web_scopes(self):
@@ -135,6 +146,80 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
                 "created_count": len(created),
             }
         )
+
+    async def _web_export_schedule(self):
+        """Download one member as ``.ics`` or a whole scope as a ``.zip``."""
+        scope_id = str(request.query.get("scope_id") or "").strip()
+        user_id = str(request.query.get("user_id") or "").strip()
+        try:
+            if user_id:
+                export = await self._export_member_ics(scope_id, user_id)
+            else:
+                export = await self._export_scope_archive(
+                    scope_id, str(request.query.get("format") or "")
+                )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        try:
+            # Writing a few megabytes must not block the event loop.
+            path = await asyncio.to_thread(
+                _write_export_file, export["filename"], export["content"]
+            )
+        except OSError as exc:
+            return error_response(f"写出导出文件失败：{exc}", status_code=500)
+        return file_response(
+            path, filename=export["filename"], content_type=export["content_type"]
+        )
+
+    async def _web_import_schedule(self):
+        """Import one .ics document (sent as text) into one member."""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。", status_code=400)
+        content = payload.get("content")
+        if not isinstance(content, str):
+            return error_response("content 必须是 .ics 文本。", status_code=400)
+        try:
+            result = await self._import_member_ics(
+                str(payload.get("scope_id") or ""),
+                str(payload.get("user_id") or ""),
+                content,
+                filename=str(payload.get("filename") or ""),
+                actor=str(request.username or "webui"),
+            )
+        except ScheduleWriteConflict as exc:
+            return error_response(str(exc), status_code=409)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(result)
+
+    async def _web_import_archive(self, scope_id: str = ""):
+        """Import an uploaded .zip (or a lone .ics) into one scope."""
+        upload = (await request.files()).get("file")
+        if upload is None:
+            return error_response("请选择要导入的 .zip 或 .ics 文件。", status_code=400)
+        too_large = f"文件超过 {MAX_ARCHIVE_BYTES // 1024 // 1024} MiB，未导入。"
+        length = getattr(upload, "content_length", None)
+        if isinstance(length, int) and length > MAX_ARCHIVE_BYTES:
+            return error_response(too_large, status_code=400)
+        try:
+            data = await upload.read(MAX_ARCHIVE_BYTES + 1)
+        except Exception as exc:
+            return error_response(f"读取上传文件失败：{exc}", status_code=400)
+        if len(data) > MAX_ARCHIVE_BYTES:
+            return error_response(too_large, status_code=400)
+        try:
+            result = await self._import_scope_archive(
+                scope_id,
+                str(upload.filename or ""),
+                data,
+                actor=str(request.username or "webui"),
+            )
+        except ScheduleWriteConflict as exc:
+            return error_response(str(exc), status_code=409)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(result)
 
     @filter.command("今日课表")
     async def today_schedule(self, event: AstrMessageEvent):
@@ -240,7 +325,7 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         result = await self._save_ics_schedule(
             event,
             content,
-            user_id=_ics_filename_target(filename),
+            user_id=_member_id_from_filename(filename),
             source_file=filename,
         )
         yield event.plain_result(result)
@@ -272,7 +357,7 @@ class CourseSchedulePlugin(CourseScheduleBase, Star):
         result = await self._save_ics_schedule(
             event,
             content,
-            user_id=_ics_filename_target(filename),
+            user_id=_member_id_from_filename(filename),
             source_file=filename,
         )
         yield event.plain_result(result)

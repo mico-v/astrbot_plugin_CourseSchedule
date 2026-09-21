@@ -51,6 +51,7 @@
               </div>
               <div class="editor-actions">
                 <span id="dirtyMark" class="dirty-mark hidden">有未保存修改</span>
+                <button id="exportMemberButton" class="button button-ghost" type="button">导出 .ics</button>
                 <button id="saveButton" class="button button-primary" type="button">保存课表</button>
               </div>
             </div>
@@ -115,6 +116,71 @@
             <button id="addMemberCancel" class="button button-ghost" type="button">取消</button>
             <button id="addMemberSubmit" class="button button-primary" type="button">添加课表</button>
           </div>
+        </footer>
+      </div>
+    </div>
+
+    <div
+      id="transferDialog"
+      class="dialog-overlay hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="transferTitle"
+    >
+      <div class="dialog-card transfer-card">
+        <header class="dialog-head">
+          <div>
+            <p class="section-kicker">IMPORT / EXPORT</p>
+            <h2 id="transferTitle">导入 / 导出</h2>
+            <p id="transferMeta" class="muted"></p>
+          </div>
+          <button id="transferClose" class="dialog-close" type="button" aria-label="关闭">×</button>
+        </header>
+
+        <section class="transfer-section">
+          <div class="transfer-heading">
+            <h3>导出全部成员</h3>
+            <span id="transferScopeCount" class="count-pill">0</span>
+          </div>
+          <p class="muted">
+            「ICS 压缩包」每位成员一个 <code>schedule&lt;QQ号&gt;.ics</code> 文件，可以直接导入手机或
+            电脑日历，也可以发到群里用 <code>/导入课表</code> 还原给对应成员；「原始备份」按插件
+            原本的存储格式导出课表和休假/调休标记，用于完整还原。
+          </p>
+          <div class="dialog-actions">
+            <button id="transferExportIcs" class="button button-secondary" type="button">导出 ICS 压缩包</button>
+            <button id="transferExportBackup" class="button button-secondary" type="button">导出原始备份</button>
+          </div>
+        </section>
+
+        <section class="transfer-section">
+          <div class="transfer-heading">
+            <h3>导入到本会话</h3>
+          </div>
+          <p class="muted">
+            <code>.zip</code> 按压缩包里的成员 QQ 号导入，不在包里的成员不受影响；导入原始备份会把
+            包内成员的课程和休假/调休标记恢复成备份时的状态，包内没有的标记会被清除。
+            <code>.ics</code> 导入到当前选中的成员，文件名为 <code>schedule&lt;QQ号&gt;.ics</code>
+            时按文件名里的 QQ 号导入。已有成员的昵称不会被覆盖。
+          </p>
+          <div class="dialog-toolbar">
+            <label class="button button-ghost file-button">
+              选择文件
+              <input
+                id="transferFile"
+                type="file"
+                accept=".zip,.ics,application/zip,text/calendar"
+              />
+            </label>
+            <span id="transferFileName" class="muted">未选择 .zip 或 .ics 文件</span>
+          </div>
+          <div class="dialog-actions">
+            <button id="transferImport" class="button button-primary" type="button" disabled>开始导入</button>
+          </div>
+        </section>
+
+        <footer class="dialog-foot">
+          <p id="transferHint" class="muted"></p>
         </footer>
       </div>
     </div>

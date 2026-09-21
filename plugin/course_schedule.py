@@ -8,6 +8,18 @@ from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
 
+from .backup import (
+    EXPORT_FORMAT_BACKUP,
+    EXPORT_FORMAT_ICS,
+    _build_backup_archive,
+    _build_ics_bundle,
+    _decode_text,
+    _member_ics_filename,
+    _member_ics_text,
+    _member_id_from_filename,
+    _read_archive,
+    _scope_slug,
+)
 from .constants import (
     DAY_OVERRIDE_ALL,
     DAY_OVERRIDE_HOLIDAY,
@@ -445,6 +457,76 @@ class CourseScheduleBase:
             raise ValueError("所选成员都已经有课表了。")
         return created
 
+    async def _store_member_ics(
+        self,
+        scope_id: str,
+        user_id: str,
+        content: str,
+        *,
+        name: str = "",
+        source_file: str = "",
+        actor: str = "",
+        uploader_id: str = "",
+    ) -> dict[str, Any]:
+        """Parse one ICS document and make it a member's whole schedule.
+
+        Raises ``ValueError`` with a message that can be shown to the user when
+        the document is empty, too large, unparsable or has no VEVENT.  Parsed
+        events keep their ``RAW_ICAL``, so properties the plugin does not model
+        (RDATE/EXDATE, for example) survive the round trip.
+        """
+        text = str(content or "").strip()
+        if not text:
+            raise ValueError("ICS 内容为空，未保存。")
+        if len(text.encode("utf-8")) > MAX_ICS_BYTES:
+            raise ValueError(f"ICS 文件超过 {MAX_ICS_BYTES // 1024 // 1024} MiB，未保存。")
+        try:
+            events, schedule_text = _parse_schedule_ics(text)
+        except ValueError as exc:
+            raise ValueError(f"ICS 解析失败，未保存：{exc}") from exc
+        if not events:
+            raise ValueError("ICS 中没有 VEVENT，未保存。")
+
+        previous = await self._schedule_store.get_member(scope_id, user_id)
+        current = previous if isinstance(previous, dict) else {}
+        now = _now_iso()
+        info = {
+            key: value
+            for key, value in current.items()
+            if key not in {"_revision", "_day_overrides", "events", "event_count"}
+        }
+        # An existing name wins: a member renamed in the WebUI keeps that name
+        # when a file is imported over their schedule.
+        info.update(
+            {
+                "name": current.get("name") or name or user_id,
+                "schedule": schedule_text,
+                "updated_at": now,
+                "schedule_updated_at": now,
+                "last_modified_at": now,
+                "last_modified_by": actor,
+                "source": "ics",
+                "source_file": source_file,
+                "event_count": len(events),
+                "events": events,
+                "ics": text,
+            }
+        )
+        if uploader_id:
+            info["uploader_id"] = uploader_id
+        await self._schedule_store.put_member(
+            scope_id,
+            user_id,
+            info,
+            expected_revision=int(current.get("_revision") or 0),
+        )
+        return {
+            "user_id": user_id,
+            "name": _display_name(info["name"]),
+            "event_count": len(events),
+            "created": not current,
+        }
+
     async def _save_ics_schedule(
         self,
         event: AstrMessageEvent,
@@ -470,22 +552,6 @@ class CourseScheduleBase:
                     "只能在群里导入自己的课表；为其他成员导入需要管理员权限。"
                 )
 
-        content = str(ics_content or "").strip()
-        if not content:
-            return "ICS 内容为空，未保存。"
-        if len(content.encode("utf-8")) > MAX_ICS_BYTES:
-            return f"ICS 文件超过 {MAX_ICS_BYTES // 1024 // 1024} MiB，未保存。"
-
-        try:
-            events, schedule_text = _parse_schedule_ics(content)
-        except ValueError as exc:
-            return f"ICS 解析失败，未保存：{exc}"
-        if not events:
-            return "ICS 中没有 VEVENT，未保存。"
-
-        scope = _scope_id(event)
-        previous = await self._schedule_store.get_member(scope, target_id) or {}
-        now = _now_iso()
         # Only the owner's own message may name the row after the sender; for
         # another member the stored name, an @ mention or the QQ number is used
         # so the uploader's nickname is never written onto someone else.
@@ -494,28 +560,272 @@ class CourseScheduleBase:
             if target_id == sender_id
             else self._agent_mention_name(event, target_id)
         )
-        info = {
-            "name": previous.get("name") or imported_name or target_id,
-            "schedule": schedule_text,
-            "updated_at": now,
-            "schedule_updated_at": now,
-            "source": "ics",
-            "source_file": source_file,
-            "uploader_id": sender_id,
-            "event_count": len(events),
-            "events": events,
-            "ics": content,
-        }
         try:
-            await self._schedule_store.put_member(
-                scope,
+            saved = await self._store_member_ics(
+                _scope_id(event),
                 target_id,
-                info,
-                expected_revision=int(previous.get("_revision") or 0),
+                ics_content,
+                name=imported_name,
+                source_file=source_file,
+                actor=sender_id,
+                uploader_id=sender_id,
             )
-        except ScheduleWriteConflict as exc:
+        except (ValueError, ScheduleWriteConflict) as exc:
             return str(exc)
-        return f"已保存 {info['name']}({target_id}) 的课程表，共 {len(events)} 个事件。"
+        return (
+            f"已保存 {saved['name']}({target_id}) 的课程表，"
+            f"共 {saved['event_count']} 个事件。"
+        )
+
+    # ------------------------------------------------------------------
+    # 导出 / 导入
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _import_summary(
+        scope_id: str,
+        archive_format: str,
+        members: list[dict[str, Any]],
+        skipped: list[str],
+        day_override_count: int = 0,
+    ) -> dict[str, Any]:
+        created = sum(1 for item in members if item.get("created"))
+        return {
+            "scope_id": scope_id,
+            "format": archive_format,
+            "members": members,
+            "member_count": len(members),
+            "created_count": created,
+            "updated_count": len(members) - created,
+            "event_count": sum(int(item.get("event_count") or 0) for item in members),
+            "day_override_count": day_override_count,
+            "skipped": skipped,
+        }
+
+    async def _export_member_ics(self, scope_id: str, user_id: str) -> dict[str, Any]:
+        """Export one member's schedule as a ``schedule<QQ号>.ics`` download.
+
+        The download keeps the group-file naming convention, so it can be sent
+        back to the group and imported for that same member.
+        """
+        scope = str(scope_id or "").strip()
+        member_id = str(user_id or "").strip()
+        if not scope or not member_id:
+            raise ValueError("scope_id 和 user_id 不能为空。")
+        info = await self._schedule_store.get_member(scope, member_id)
+        if not isinstance(info, dict):
+            raise ValueError("找不到指定成员的课程表。")
+        name = _display_name(info.get("name") or member_id)
+        return {
+            "filename": _member_ics_filename(member_id),
+            "content": _member_ics_text(info, name).encode("utf-8"),
+            "content_type": "text/calendar; charset=utf-8",
+        }
+
+    async def _export_scope_archive(
+        self, scope_id: str, archive_format: str = EXPORT_FORMAT_ICS
+    ) -> dict[str, Any]:
+        """Pack every member of one scope into a downloadable zip."""
+        scope = str(scope_id or "").strip()
+        if not scope.startswith(("group:", "private:")):
+            raise ValueError("无效的 scope_id。")
+        chosen = str(archive_format or EXPORT_FORMAT_ICS).strip().lower()
+        if chosen not in {EXPORT_FORMAT_ICS, EXPORT_FORMAT_BACKUP}:
+            raise ValueError("format 只能是 ics 或 backup。")
+        members = await self._schedule_store.get_scope_members(scope)
+        if not members:
+            raise ValueError("该会话还没有成员课表，无法导出。")
+        now = datetime.now(LOCAL_TZ)
+        if chosen == EXPORT_FORMAT_BACKUP:
+            overrides = await self._schedule_store.list_day_overrides(scope)
+            content = _build_backup_archive(scope, members, overrides, stamp=now)
+        else:
+            content = _build_ics_bundle(scope, members, stamp=now)
+        return {
+            "filename": (
+                f"course-schedule-{chosen}-{_scope_slug(scope)}-{now:%Y%m%d-%H%M%S}.zip"
+            ),
+            "content": content,
+            "content_type": "application/zip",
+        }
+
+    async def _import_member_ics(
+        self,
+        scope_id: str,
+        user_id: str,
+        content: str,
+        *,
+        filename: str = "",
+        actor: str = "webui",
+    ) -> dict[str, Any]:
+        """Import one .ics document into one member of one scope."""
+        scope = str(scope_id or "").strip()
+        if not scope.startswith(("group:", "private:")):
+            raise ValueError("无效的 scope_id。")
+        # The group-file convention wins over the selected member, exactly like
+        # the chat import.
+        target_id = _member_id_from_filename(filename) or str(user_id or "").strip()
+        if not target_id:
+            raise ValueError(
+                "请先选择要导入的成员，或把文件命名为 schedule<QQ号>.ics。"
+            )
+        saved = await self._store_member_ics(
+            scope,
+            target_id,
+            content,
+            source_file=filename,
+            actor=actor,
+            uploader_id=actor,
+        )
+        return self._import_summary(scope, EXPORT_FORMAT_ICS, [saved], [])
+
+    async def _restore_backup_member(
+        self, scope_id: str, member: dict[str, Any], *, actor: str = "webui"
+    ) -> dict[str, Any]:
+        """Write one member record from a backup archive back into the store."""
+        user_id = str(member.get("user_id") or "")
+        events = [item for item in member.get("events") or [] if isinstance(item, dict)]
+        previous = await self._schedule_store.get_member(scope_id, user_id)
+        current = previous if isinstance(previous, dict) else {}
+        source = member.get("info") if isinstance(member.get("info"), dict) else {}
+        now = _now_iso()
+        info = {
+            key: value
+            for key, value in source.items()
+            if key
+            not in {
+                "name",
+                "events",
+                "event_count",
+                "ics",
+                "schedule",
+                "updated_at",
+                "schedule_updated_at",
+                "last_modified_at",
+                "last_modified_by",
+            }
+        }
+        info.update(
+            {
+                # The current name wins, so restoring a backup does not undo a
+                # rename done after it was taken.
+                "name": current.get("name")
+                or _display_name(member.get("name") or "")
+                or user_id,
+                "event_count": len(events),
+                # Derived fields are rebuilt from the events so they cannot
+                # disagree with what a later save would produce; the stored ICS
+                # is kept as the base calendar for its VTIMEZONE and similar
+                # non-VEVENT properties.
+                "ics": _serialize_schedule_ics(events, str(source.get("ics") or "")),
+                "schedule": _format_ics_schedule(events),
+                "updated_at": now,
+                "schedule_updated_at": now,
+                "last_modified_at": now,
+                "last_modified_by": actor,
+                "events": events,
+            }
+        )
+        await self._schedule_store.put_member(scope_id, user_id, info)
+        return {
+            "user_id": user_id,
+            "name": _display_name(info["name"]),
+            "event_count": len(events),
+        }
+
+    async def _restore_day_overrides(
+        self,
+        scope_id: str,
+        rows: list[dict[str, str]],
+        member_ids: set[str],
+        *,
+        actor: str = "webui",
+    ) -> int:
+        """Make one scope's 休假/调休 markers match a backup exactly.
+
+        Only the members the backup contains (plus the scope-wide markers) are
+        rewritten; markers of other members are left untouched.
+        """
+        now = _now_iso()
+        prepared = [
+            {
+                "user_id": str(row.get("user_id") or ""),
+                "day": str(row.get("day") or ""),
+                "kind": str(row.get("kind") or ""),
+                "source_day": str(row.get("source_day") or ""),
+                "created_by": str(row.get("created_by") or "") or actor,
+                "created_at": str(row.get("created_at") or "") or now,
+            }
+            for row in rows
+        ]
+        return await self._schedule_store.replace_day_overrides(
+            scope_id, set(member_ids) | {DAY_OVERRIDE_ALL}, prepared
+        )
+
+    async def _import_scope_archive(
+        self,
+        scope_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        actor: str = "webui",
+    ) -> dict[str, Any]:
+        """Import an exported .zip (or a lone .ics) into one scope.
+
+        Members are matched by the QQ号 in the file name, so nothing has to be
+        selected beforehand; the archive decides which members it carries.
+        """
+        scope = str(scope_id or "").strip()
+        if not scope.startswith(("group:", "private:")):
+            raise ValueError("无效的 scope_id。")
+        if str(filename or "").strip().lower().endswith(".ics"):
+            return await self._import_member_ics(
+                scope, "", _decode_text(data), filename=filename, actor=actor
+            )
+
+        archive = _read_archive(data)
+        existing = await self._schedule_store.get_scope_members(scope)
+        members: list[dict[str, Any]] = []
+        skipped = list(archive["skipped"])
+        for member in archive["members"]:
+            user_id = member["user_id"]
+            try:
+                if archive["format"] == EXPORT_FORMAT_BACKUP:
+                    saved = await self._restore_backup_member(scope, member, actor=actor)
+                else:
+                    saved = await self._store_member_ics(
+                        scope,
+                        user_id,
+                        member["content"],
+                        name=member.get("name", ""),
+                        source_file=member.get("file") or filename,
+                        actor=actor,
+                        uploader_id=actor,
+                    )
+            except ValueError as exc:
+                # One bad file must not abort the whole archive.
+                skipped.append(f"{member.get('file') or user_id}（{exc}）")
+                continue
+            saved["created"] = user_id not in existing
+            members.append(saved)
+
+        override_count = 0
+        if archive["format"] == EXPORT_FORMAT_BACKUP:
+            override_count = await self._restore_day_overrides(
+                scope,
+                archive["day_overrides"],
+                {member["user_id"] for member in archive["members"]},
+                actor=actor,
+            )
+        if not members:
+            note = "、".join(skipped[:5])
+            raise ValueError(
+                "压缩包里没有可导入的成员课表。"
+                + (f"被忽略的文件：{note}" if note else "")
+            )
+        return self._import_summary(
+            scope, archive["format"], members, skipped, override_count
+        )
 
     @staticmethod
     def _agent_action(value: str) -> str:
