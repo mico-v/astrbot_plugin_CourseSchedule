@@ -143,7 +143,9 @@ def daily_member_rows(
         if not isinstance(info, dict):
             continue
         occurrences = _expand_member_occurrences(info, start_bound, end_bound)
-        occurrences.sort(key=lambda item: item["_start"])
+        # Same start time -> the class that ends first is the one shown; this is
+        # what makes the featured course on a card stable between renders.
+        occurrences.sort(key=lambda item: (item["_start"], item["_end"]))
         override = _member_day_overrides(info).get(target.isoformat()) or {}
         holiday = override.get("kind") == DAY_OVERRIDE_HOLIDAY
         override_source = (

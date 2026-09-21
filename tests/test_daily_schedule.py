@@ -54,6 +54,36 @@ class DailyScheduleTests(unittest.TestCase):
         self.assertEqual(rows[0]["time"], "当天没有安排课程")
         self.assertEqual(rows[0]["countdown_label"], "课程状态")
 
+    def test_courses_starting_together_are_ordered_by_end_time(self) -> None:
+        """Two classes at 08:00: the one that ends first is the one shown."""
+        members = {
+            "1": {
+                "name": "小明",
+                "events": [
+                    _occurrence(8, 12, "实验课"),
+                    _occurrence(8, 9, "早课"),
+                ],
+            }
+        }
+        rows = domain.daily_member_rows(
+            members,
+            date(2026, 8, 31),
+            now=datetime(2026, 8, 31, 7, 30, tzinfo=LOCAL_TZ),
+        )
+        self.assertEqual(rows[0]["status_key"], "upcoming")
+        self.assertEqual(rows[0]["course"], "早课")
+        self.assertEqual(rows[0]["time"], "08:00 - 09:00")
+
+        expanded = domain._expand_member_occurrences(
+            members["1"],
+            datetime(2026, 8, 31, tzinfo=LOCAL_TZ),
+            datetime(2026, 9, 1, tzinfo=LOCAL_TZ),
+        )
+        self.assertEqual(
+            [(item["SUMMARY"], item["_end"].strftime("%H:%M")) for item in expanded],
+            [("早课", "09:00"), ("实验课", "12:00")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

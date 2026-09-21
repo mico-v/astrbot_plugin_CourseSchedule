@@ -48,6 +48,30 @@ class StandardICSTests(unittest.TestCase):
         self.assertIn("X-CUSTOM-PROPERTY:keep-me", serialized)
         self.assertIn("EXDATE;TZID=Asia/Shanghai:20260902T090000", serialized)
 
+    def test_same_start_events_are_numbered_by_end_time(self) -> None:
+        """course_id is a position, so the order must not follow the file."""
+        content = (
+            "BEGIN:VCALENDAR\r\n"
+            "VERSION:2.0\r\n"
+            "BEGIN:VEVENT\r\n"
+            "UID:long\r\n"
+            "DTSTART;TZID=Asia/Shanghai:20260831T090000\r\n"
+            "DTEND;TZID=Asia/Shanghai:20260831T120000\r\n"
+            "SUMMARY:实验课\r\n"
+            "END:VEVENT\r\n"
+            "BEGIN:VEVENT\r\n"
+            "UID:short\r\n"
+            "DTSTART;TZID=Asia/Shanghai:20260831T090000\r\n"
+            "DTEND;TZID=Asia/Shanghai:20260831T103000\r\n"
+            "SUMMARY:高等数学\r\n"
+            "END:VEVENT\r\n"
+            "END:VCALENDAR\r\n"
+        )
+        events, _text = ics._parse_schedule_ics(content)
+        self.assertEqual(
+            [event["SUMMARY"] for event in events], ["高等数学", "实验课"]
+        )
+
     def test_rewriting_an_edited_event_keeps_extensions_and_calendar_properties(self) -> None:
         """Every edit path reserializes the event list through this function."""
         events, _text = ics._parse_schedule_ics(SAMPLE_ICS)

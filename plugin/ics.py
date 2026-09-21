@@ -62,7 +62,9 @@ def _parse_ics_events(content: str) -> list[dict[str, str]]:
     if len(components) > MAX_EVENTS_PER_FILE:
         raise ValueError(f"VEVENT 数量超过上限 {MAX_EVENTS_PER_FILE}")
     events = [_component_to_event(component) for component in components]
-    events.sort(key=lambda event: event.get("DTSTART", ""))
+    # End time breaks ties so two classes starting together keep a fixed order;
+    # every other write path sorts the same way, and course_id is a position.
+    events.sort(key=lambda event: (event.get("DTSTART", ""), event.get("DTEND", "")))
     return events
 
 

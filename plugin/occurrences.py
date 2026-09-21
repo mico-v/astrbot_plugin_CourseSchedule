@@ -214,7 +214,9 @@ def _expand_indexed_occurrences(
             shifted["_shifted_from"] = source_day.isoformat()
             indexed.append((index, shifted))
 
-    indexed.sort(key=lambda item: item[1]["_start"])
+    # End time breaks ties between classes that start together, so the order a
+    # card renders is fixed instead of following the stored event order.
+    indexed.sort(key=lambda item: (item[1]["_start"], item[1]["_end"]))
     return indexed
 
 
